@@ -32,10 +32,11 @@ Use a private server, bind to localhost by default, and place it behind your own
 Environment variables:
 
 - `RTWEB_DB`: SQLite database path, defaults to `app.db`
-- `RTWEB_PASSWORD`: admin password, defaults to `change-me`
+- `RTWEB_ADMIN_PASSWORD` or `RTWEB_PASSWORD`: admin password, defaults to `change-me`
 - `RTWEB_SESSION_SECRET`: session-signing secret, random by default per process
 - `RTWEB_HOST`: bind host, defaults to `127.0.0.1`
 - `RTWEB_PORT`: bind port, defaults to `8020`
+- `RTWEB_COOKIE_SECURE`: set to `0` only for local plain-HTTP development
 
 Example:
 

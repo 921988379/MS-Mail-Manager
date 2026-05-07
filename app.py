@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import base64
-import base64
 import hashlib
 import hmac
 import html
@@ -22,7 +21,7 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = Path(os.environ.get('RTWEB_DB', BASE_DIR / 'app.db'))
-ADMIN_PASSWORD = os.environ.get('RTWEB_ADMIN_PASSWORD', 'change-me')
+ADMIN_PASSWORD = os.environ.get('RTWEB_ADMIN_PASSWORD') or os.environ.get('RTWEB_PASSWORD', 'change-me')
 SESSION_SECRET = os.environ.get('RTWEB_SESSION_SECRET', secrets.token_hex(32))
 BIND_HOST = os.environ.get('RTWEB_HOST', '127.0.0.1')
 BIND_PORT = int(os.environ.get('RTWEB_PORT', '8020'))
@@ -66,7 +65,8 @@ def sign_session(ts: str) -> str:
 
 def make_session_cookie() -> str:
     ts = str(int(time.time()))
-    return f'rtweb={ts}.{sign_session(ts)}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=604800'
+    secure = '; Secure' if os.environ.get('RTWEB_COOKIE_SECURE', '1') != '0' else ''
+    return f'rtweb={ts}.{sign_session(ts)}; HttpOnly{secure}; SameSite=Lax; Path=/; Max-Age=604800'
 
 
 def parse_cookies(cookie_header: str):
@@ -79,7 +79,8 @@ def parse_cookies(cookie_header: str):
 
 
 def make_active_account_cookie(account_id: str) -> str:
-    return f'active_account_id={urllib.parse.quote(str(account_id))}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=604800'
+    secure = '; Secure' if os.environ.get('RTWEB_COOKIE_SECURE', '1') != '0' else ''
+    return f'active_account_id={urllib.parse.quote(str(account_id))}; HttpOnly{secure}; SameSite=Lax; Path=/; Max-Age=604800'
 
 
 def get_active_account_id(cookie_header: str) -> str:
@@ -458,7 +459,7 @@ def render_home_page(active_account_id: str = ''):
     accounts = saved_accounts()
     active_email = ''
     account_rows = ''.join(
-        f'<tr class="{"ok" if str(a["id"]) == str(active_account_id) else ""}"><td>{a["id"]}</td><td>{html.escape(a["email"])}</td><td>{html.escape(a["password_mask"] or "")}</td><td>{html.escape(a["client_id"])}</td><td>{html.escape(a["token_mask"])}</td><td>{html.escape(a["last_status"] or "")}</td><td>{html.escape((a["last_error"] or "")[:80])}</td><td><a href="/select?id={a["id"]}">登录/选中</a> · <a href="/delete?id={a["id"]}" onclick="return confirm(\'删除这个账号？\')">删除</a></td></tr>'
+        f'<tr class="{"ok" if str(a["id"]) == str(active_account_id) else ""}"><td>{a["id"]}</td><td>{html.escape(a["email"])}</td><td>{html.escape(a["password_mask"] or "")}</td><td>{html.escape(a["client_id"])}</td><td>{html.escape(a["token_mask"])}</td><td>{html.escape(a["last_status"] or "")}</td><td>{html.escape((a["last_error"] or "")[:80])}</td><td><a href="/select?id={a["id"]}">登录/选中</a><form method="post" action="/delete" style="display:inline" onsubmit="return confirm(\'删除这个账号？\')"><input type="hidden" name="id" value="{a["id"]}"><button type="submit" style="padding:3px 6px;margin-left:6px;background:#dc2626">删除</button></form></td></tr>'
         for a in accounts
     )
     for a in accounts:
@@ -567,11 +568,6 @@ class Handler(BaseHTTPRequestHandler):
             account_id = urllib.parse.parse_qs(parsed.query).get('id', [''])[0]
             self.read_saved_account(account_id)
             return
-        if parsed.path == '/delete':
-            account_id = urllib.parse.parse_qs(parsed.query).get('id', [''])[0]
-            delete_saved_account(account_id)
-            self.redirect('/')
-            return
         self.send_html(render_home_page(get_active_account_id(self.headers.get('Cookie', ''))))
 
     def send_json(self, payload, status=200):
@@ -634,6 +630,11 @@ class Handler(BaseHTTPRequestHandler):
             return
         if not self.require_auth():
             self.redirect('/login'); return
+        if self.path == '/delete':
+            form = self.read_form()
+            delete_saved_account(form.get('id', ''))
+            self.redirect('/')
+            return
         if self.path == '/batch':
             form = self.read_form()
             rows = parse_batch_accounts(form.get('batch', ''))
