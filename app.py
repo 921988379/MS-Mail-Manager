@@ -29,7 +29,7 @@ APP_VERSION = os.environ.get('RTWEB_VERSION', VERSION_FILE.read_text().strip() i
 RELEASE_REPO_URL = os.environ.get('RTWEB_RELEASE_REPO', 'https://github.com/921988379/MS-Mail-Manager')
 UPDATE_REPO = os.environ.get('RTWEB_UPDATE_REPO', RELEASE_REPO_URL + '.git')
 UPDATE_BRANCH = os.environ.get('RTWEB_UPDATE_BRANCH', 'main')
-AUTO_UPDATE_ENABLED = os.environ.get('RTWEB_AUTO_UPDATE_ENABLED', '0') == '1'
+AUTO_UPDATE_ENABLED = os.environ.get('RTWEB_AUTO_UPDATE_ENABLED', '1') != '0'
 UPDATE_COMMAND = os.environ.get('RTWEB_UPDATE_COMMAND', './scripts/update.sh')
 DB_PATH = Path(os.environ.get('RTWEB_DB', BASE_DIR / 'app.db'))
 ADMIN_PASSWORD = os.environ.get('RTWEB_ADMIN_PASSWORD') or os.environ.get('RTWEB_PASSWORD', 'change-me')
@@ -1004,7 +1004,7 @@ def render_version_page(message: str = ''):
     else:
         release_text = '点击检测更新'
         release_cls = 'muted'
-    update_badge = '已启用' if info.get('auto_update_enabled') else '未启用'
+    update_badge = '可用' if info.get('auto_update_enabled') else '已关闭'
     update_cls = 'ok' if info.get('auto_update_enabled') else 'bad'
     msg_html = ''
     if message:
@@ -1012,14 +1012,14 @@ def render_version_page(message: str = ''):
     update_button = (
         '<button type="submit" class="primary">立即更新</button>'
         if info.get('auto_update_enabled')
-        else '<button type="submit" disabled title="请先设置 RTWEB_AUTO_UPDATE_ENABLED=1">立即更新</button>'
+        else '<button type="submit" disabled title="已设置 RTWEB_AUTO_UPDATE_ENABLED=0，手动更新关闭">立即更新</button>'
     )
     content = f"""
 <section class="section-stack">
   <div class="toolbox-hero">
     <div class="toolbox-kicker">⬆️ Update</div>
     <h1 class="toolbox-title">版本更新</h1>
-    <p class="toolbox-desc">检查项目是否有新版本；如已启用自动更新，可在这里手动更新。</p>
+    <p class="toolbox-desc">检查项目是否有新版本，并可在这里手动执行更新。</p>
     <div class="toolbox-stats">
       <span class="stat-pill">当前版本：<b>{html.escape(info.get('version') or APP_VERSION)}</b></span>
       <span class="stat-pill">最新版本：<b>{latest_tag}</b></span>
@@ -1040,7 +1040,7 @@ def render_version_page(message: str = ''):
       <form method="post" action="/update" class="action-row">
         {update_button}
       </form>
-      <p class="muted" style="margin-top:12px">手动更新默认关闭，需要设置 <code>RTWEB_AUTO_UPDATE_ENABLED=1</code> 后才可执行。更新前建议先备份数据库和环境配置。</p>
+      <p class="muted" style="margin-top:12px">手动更新默认可用；如需关闭，可设置 <code>RTWEB_AUTO_UPDATE_ENABLED=0</code>。更新前建议先备份数据库和环境配置。</p>
     </div>
 
     <div class="card">
@@ -3233,7 +3233,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         if post_path == '/update':
             if not AUTO_UPDATE_ENABLED:
-                self.send_html(render_version_page('自动更新未启用。请先设置 RTWEB_AUTO_UPDATE_ENABLED=1。'))
+                self.send_html(render_version_page('手动更新已关闭。请移除 RTWEB_AUTO_UPDATE_ENABLED=0 或设置为 1 后再执行。'))
                 return
             code, out = run_shell_command(UPDATE_COMMAND, timeout=180)
             msg = ('更新命令执行完成。' if code == 0 else '更新命令执行失败。') + '\n' + out[:1200]

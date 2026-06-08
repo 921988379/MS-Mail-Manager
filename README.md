@@ -4,7 +4,7 @@
 
 - 官网/线上入口：`https://token.seoyh.net/`
 - 仓库：`https://github.com/921988379/MS-Mail-Manager`
-- 当前版本：`1.0.5`
+- 当前版本：`1.0.6`
 - 版权支持：由 [一点优化](https://www.seoyh.net/) 提供
 
 > 安全提醒：本项目会处理邮箱密码、Refresh Token、Access Token、验证码邮件等敏感数据。请只部署在自己可信服务器上，并妥善保存 `RTWEB_DATA_KEY`、数据库和环境变量文件。
@@ -423,22 +423,25 @@ API 不返回邮箱密码、Refresh Token、Access Token 明文。
 - 检查远程最新提交
 - 可选执行更新命令
 
-### 默认安全策略
+### 默认策略
 
-自动更新默认关闭：
+手动更新默认可用：
+
+```text
+RTWEB_AUTO_UPDATE_ENABLED=1
+```
+
+后台可以“检测更新”，也可以点击“立即更新”执行更新命令。更新前建议先做好数据库/env 备份，并确认当前部署路径和权限正确。
+
+如果你希望禁止后台手动更新，可以设置：
 
 ```text
 RTWEB_AUTO_UPDATE_ENABLED=0
 ```
 
-这样后台只能“检查更新”，不能直接覆盖线上代码。
-
-### 启用自动更新
-
-确认你已经做好数据库/env 备份，并确认更新命令安全后，再设置：
+常用配置：
 
 ```text
-RTWEB_AUTO_UPDATE_ENABLED=1
 RTWEB_UPDATE_REPO=https://github.com/921988379/MS-Mail-Manager.git
 RTWEB_UPDATE_BRANCH=main
 RTWEB_UPDATE_COMMAND=./scripts/update.sh
