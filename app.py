@@ -951,42 +951,38 @@ def public_project_rows():
 def render_version_page(message: str = ''):
     info = version_info(fetch_remote=False)
     repo_url = html.escape(info.get('release_repo') or RELEASE_REPO_URL)
-    remote_url = html.escape(info.get('remote') or UPDATE_REPO)
-    branch = html.escape(info.get('update_branch') or UPDATE_BRANCH)
-    commit = html.escape(info.get('commit') or 'unknown')
-    latest_commit = html.escape(info.get('latest_commit') or '未检测')
     latest_tag = html.escape(info.get('latest_tag') or '未检测')
-    current_tag = html.escape(info.get('current_tag') or '未打 tag')
-    behind_raw = str(info.get('behind') or '')
-    behind_text = '未检测' if behind_raw == '' else ('已是最新' if behind_raw == '0' else f'落后 {html.escape(behind_raw)} 个提交')
     release_raw = str(info.get('release_behind') or '')
-    release_text = '未检测' if release_raw == '' else ('已是最新 Release' if release_raw == '0' else f'落后最新 Release {html.escape(release_raw)} 个提交')
+    if release_raw == '0':
+        release_text = '已是最新版'
+        release_cls = 'ok'
+    elif release_raw:
+        release_text = '发现新版本'
+        release_cls = 'bad'
+    else:
+        release_text = '点击检测更新'
+        release_cls = 'muted'
     update_badge = '已启用' if info.get('auto_update_enabled') else '未启用'
     update_cls = 'ok' if info.get('auto_update_enabled') else 'bad'
     msg_html = ''
     if message:
-        msg_html = '<div class="card"><h3>操作结果</h3><pre>' + html.escape(message) + '</pre></div>'
+        msg_html = '<div class="card"><h3>提示</h3><p>' + html.escape(message).replace('\n', '<br>') + '</p></div>'
     update_button = (
-        '<button type="submit" class="primary">执行手动更新</button>'
+        '<button type="submit" class="primary">立即更新</button>'
         if info.get('auto_update_enabled')
-        else '<button type="submit" disabled title="请先设置 RTWEB_AUTO_UPDATE_ENABLED=1">手动更新未启用</button>'
+        else '<button type="submit" disabled title="请先设置 RTWEB_AUTO_UPDATE_ENABLED=1">立即更新</button>'
     )
     content = f"""
 <section class="section-stack">
   <div class="toolbox-hero">
-    <div class="toolbox-kicker">⬆️ Version & Update</div>
-    <h1 class="toolbox-title">版本 / 更新</h1>
-    <p class="toolbox-desc">查看当前仓库地址、运行版本、Git 提交和远程更新状态。自动更新默认关闭，避免未经确认的后台代码变更。</p>
+    <div class="toolbox-kicker">⬆️ Update</div>
+    <h1 class="toolbox-title">版本更新</h1>
+    <p class="toolbox-desc">检查项目是否有新版本；如已启用自动更新，可在这里手动更新。</p>
     <div class="toolbox-stats">
       <span class="stat-pill">当前版本：<b>{html.escape(info.get('version') or APP_VERSION)}</b></span>
-      <span class="stat-pill">当前 Release：<b>{current_tag}</b></span>
-      <span class="stat-pill">最新 Release：<b>{latest_tag}</b></span>
-      <span class="stat-pill">Release 状态：<b>{release_text}</b></span>
-      <span class="stat-pill">当前分支：<b>{html.escape(info.get('branch') or UPDATE_BRANCH)}</b></span>
-      <span class="stat-pill">本地提交：<b>{commit}</b></span>
-      <span class="stat-pill">远程提交：<b>{latest_commit}</b></span>
-      <span class="stat-pill">分支状态：<b>{behind_text}</b></span>
-      <span class="stat-pill">自动更新：<b class="{update_cls}">{update_badge}</b></span>
+      <span class="stat-pill">最新版本：<b>{latest_tag}</b></span>
+      <span class="stat-pill">状态：<b class="{release_cls}">{release_text}</b></span>
+      <span class="stat-pill">手动更新：<b class="{update_cls}">{update_badge}</b></span>
     </div>
   </div>
 
@@ -994,34 +990,25 @@ def render_version_page(message: str = ''):
 
   <div class="quick-actions">
     <div class="card">
-      <h3>仓库地址</h3>
-      <p><a href="{repo_url}" target="_blank" rel="noopener noreferrer">{repo_url}</a></p>
-      <table>
-        <tr><th>项目</th><th>值</th></tr>
-        <tr><td>Release 仓库</td><td><code>{repo_url}</code></td></tr>
-        <tr><td>Git 远程</td><td><code>{remote_url}</code></td></tr>
-        <tr><td>更新分支</td><td><code>{branch}</code></td></tr>
-        <tr><td>更新命令</td><td><code>{html.escape(UPDATE_COMMAND)}</code></td></tr>
-      </table>
-    </div>
-
-    <div class="card">
       <h3>更新操作</h3>
-      <p class="muted">“检测更新”只执行 <code>git fetch --tags</code>，同时刷新远程分支和最新 Release Tag；不会改动当前代码。</p>
       <form method="post" action="/check-update" class="action-row" style="margin-bottom:10px">
         <button type="submit" class="primary">检测更新</button>
-        <a class="mini-btn" href="/version">刷新页面</a>
+        <a class="mini-btn" href="{repo_url}" target="_blank" rel="noopener noreferrer">查看仓库</a>
       </form>
-      <p class="muted">“手动更新”会执行 <code>{html.escape(UPDATE_COMMAND)}</code>。只有环境变量 <code>RTWEB_AUTO_UPDATE_ENABLED=1</code> 时才允许执行。</p>
       <form method="post" action="/update" class="action-row">
         {update_button}
       </form>
-      <div class="notice info" style="margin-top:12px">建议更新前先备份 <code>/www/server/rtweb/app.db</code> 和 <code>/www/server/rtweb/rtweb.env</code>。更新功能不会展示或返回数据库中的密码、Refresh Token、Access Token。</div>
+      <p class="muted" style="margin-top:12px">手动更新默认关闭，需要设置 <code>RTWEB_AUTO_UPDATE_ENABLED=1</code> 后才可执行。更新前建议先备份数据库和环境配置。</p>
+    </div>
+
+    <div class="card">
+      <h3>仓库地址</h3>
+      <p><a href="{repo_url}" target="_blank" rel="noopener noreferrer">{repo_url}</a></p>
+      <p class="muted">页面只展示必要版本信息；分支、提交号、远程地址等调试信息已隐藏。</p>
     </div>
   </div>
 </section>"""
     return app_page('版本/更新', 'version', content)
-
 
 
 def get_saved_account_by_email(email_addr: str):
