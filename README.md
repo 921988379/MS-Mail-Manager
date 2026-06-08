@@ -135,7 +135,135 @@ location / {
 }
 ```
 
-## 使用说明
+
+## 使用说明（完整流程）
+
+### 1. 导入邮箱
+
+入口：后台 `/mailboxes` → “批量导入”。一行一个邮箱：
+
+```text
+邮箱----密码----应用ID(Client ID)----Refresh Token----辅助邮箱----辅助密码----分类/项目
+```
+
+字段说明：
+
+| 字段 | 是否必填 | 说明 |
+| --- | --- | --- |
+| 邮箱 | 必填 | Outlook / Hotmail 邮箱地址 |
+| 密码 | 可选 | 用于密码 IMAP 兜底读取验证码；不会用于生成 Refresh Token |
+| Client ID | 令牌账号必填 | Microsoft OAuth 应用 ID |
+| Refresh Token | 令牌账号必填 | 用于刷新 Access Token，保存后加密入库 |
+| 辅助邮箱/密码 | 可选 | 仅作为账号资料保存 |
+| 分类/项目 | 可选 | 用于分组、API 按项目取码 |
+
+兼容分隔符：`----`、`|`、逗号、Tab。旧格式 `邮箱----Client ID----Refresh Token` 也支持。
+
+### 2. 令牌类型说明
+
+| 类型 | 用途 | 适合场景 |
+| --- | --- | --- |
+| Graph 令牌 | 通过 Microsoft Graph `Mail.Read` 读取邮件 | 最推荐，稳定、速度快、可读收件箱和垃圾箱 |
+| OAuth IMAP 令牌 | Access Token 通过 IMAP XOAUTH2 登录 | Graph 不可读时的兼容方案 |
+| 密码 IMAP | 保存邮箱密码后用 IMAP 直接读取 | 令牌失效时兜底判断账号是否还能收信 |
+| 无令牌账号 | 只保存邮箱/密码/分类 | 不能刷新 token；如有密码可尝试 IMAP 取码 |
+
+系统读取验证码顺序：
+
+```text
+Graph → OAuth IMAP → 密码 IMAP
+```
+
+综合检测会告诉你哪个通道可用。
+
+### 3. 刷新令牌 / 获取 Access Token
+
+| 功能 | 入口 | 说明 |
+| --- | --- | --- |
+| 单个刷新 | `/tokens` | 输入 Client ID + Refresh Token，换取 Access Token |
+| 批量获取令牌 | 邮箱管理 → 批量操作 → 获取令牌 | 后台执行，显示进度条和当前处理邮箱 |
+| 批量刷新令牌 | 邮箱管理/令牌管理 | 异步执行，避免大批量请求 502 |
+| 状态检测 | 检测状态 / 批量检测 | 验证 Refresh Token 是否可换 Access Token |
+
+如 Microsoft 返回新的 Refresh Token，系统会自动轮换保存。Token 结果默认隐藏，只提供“显示/复制”按钮，降低误泄露风险。
+
+### 4. 获取邮件和验证码
+
+入口：`/mails` 或外部 API `/api/v1/latest-code`。
+
+流程：
+
+1. 选择邮箱，或 API 指定 `email/category`
+2. 用 Refresh Token 换 Access Token
+3. 优先通过 Microsoft Graph 读取收件箱/垃圾邮箱
+4. Graph 失败后尝试 OAuth IMAP
+5. 如令牌失败且保存了密码，再尝试密码 IMAP
+6. 从最新邮件主题/摘要中识别验证码
+
+取不到验证码不一定代表账号挂了，可能是最近没有验证码邮件、规则不匹配、邮件延迟或 Microsoft 风控。
+
+### 5. 项目/分类管理
+
+入口：`/project-manage`、`/categories`。
+
+| 能力 | 用途 |
+| --- | --- |
+| 分类 | 给邮箱分组，批量导入时最后一列可直接写分类 |
+| 项目规则 | 按项目配置邮箱组、关键词过滤和返回数量 |
+| API 按项目查询 | `/api/v1/latest-code?category=项目名` |
+| 批量改分类 | 勾选邮箱后可批量设置分类 |
+
+### 6. 外部 API 使用
+
+推荐统一使用请求头传 API Key：
+
+```text
+X-API-Key: ***
+```
+
+不要在 URL 明文传 key。
+
+常用接口：
+
+```bash
+curl -H "X-API-Key: ***" "https://token.seoyh.net/api/v1/health"
+curl -H "X-API-Key: ***" "https://token.seoyh.net/api/v1/projects"
+curl -H "X-API-Key: ***" "https://token.seoyh.net/api/v1/accounts?category=项目名"
+curl -H "X-API-Key: ***" "https://token.seoyh.net/api/v1/latest-code?email=xxx@outlook.com"
+curl -H "X-API-Key: ***" "https://token.seoyh.net/api/v1/latest-code?category=项目名"
+curl -H "X-API-Key: ***" "https://token.seoyh.net/api/v1/account-status?email=xxx@outlook.com"
+```
+
+| 接口 | scope | 说明 |
+| --- | --- | --- |
+| `/health` | `health` | 健康检查 |
+| `/projects` | `projects` | 返回项目/分类列表 |
+| `/accounts` | `accounts` | 返回账号元数据和状态，不返回密码/token |
+| `/latest-code` | `latest_code` | 读取最新验证码 |
+| `/account-status` | `accounts + latest_code` | 返回综合状态摘要 |
+
+业务失败会返回 `ok:false` 和错误信息；服务本身正常时尽量不把账号失败伪装成 HTTP 502。
+
+### 7. 免导入接口说明
+
+当前版本默认不提供“外部直接传邮箱密码/Refresh Token 的免导入取码接口”。
+
+原因：这类接口会让敏感凭证经过 URL、日志或第三方系统，安全风险更高。
+
+推荐做法：先在后台导入并加密保存账号，再通过 API Key + `email/category` 调用。这样外部系统不需要持有邮箱密码或 Refresh Token。
+
+### 8. 常见问题
+
+| 问题 | 原因 | 处理建议 |
+| --- | --- | --- |
+| `invalid_grant` | Refresh Token 被撤销、过期或账号安全状态变化 | 重新 OAuth 授权获取新 Refresh Token |
+| `AADSTS70000` | scope 未授权或授权过期 | 系统会兼容旧授权重试；仍失败时重新授权当前 scope |
+| Graph 失败但密码 IMAP 可读 | Graph 权限/令牌异常，账号本身可能还能收信 | 继续用密码 IMAP 兜底，同时重新生成令牌 |
+| OAuth IMAP 提示 authenticated but not connected | 账号未初始化 Exchange mailbox 或邮箱服务不可用 | 登录 Outlook 网页版初始化，或改用 Graph/密码 IMAP |
+| API Key 无效 | Key 错误、被禁用或 scope 不足 | 到 API 密钥页检查启用状态、scope 和限流 |
+| 批量任务很慢 | Microsoft 网络、邮箱数量、IMAP 超时都会影响速度 | 观察进度条；系统已限制并发并异步执行，避免 502 |
+
+## 使用说明（简版入口）
 
 ### 登录
 
