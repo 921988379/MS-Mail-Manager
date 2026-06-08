@@ -7,15 +7,24 @@ spec = importlib.util.spec_from_file_location('app', str(Path(__file__).resolve(
 app = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(app)
 
-class SinglePageUITests(unittest.TestCase):
-    def test_home_page_has_compact_regions_and_no_recent_records(self):
-        with patch.object(app, 'recent_records', return_value=[]), patch.object(app, 'saved_accounts', return_value=[]):
+class ToolboxUITests(unittest.TestCase):
+    def test_home_page_is_toolbox_dashboard(self):
+        with patch.object(app, 'dashboard_summary', return_value={
+            'total_accounts': 0,
+            'ok_accounts': 0,
+            'error_accounts': 0,
+            'categories': 0,
+            'api_keys': 0,
+            'api_calls_today': 0,
+            'api_fail_today': 0,
+            'recent': [],
+        }):
             html = app.render_home_page()
-        self.assertIn('class="grid"', html)
-        self.assertIn('保存账号', html)
-        self.assertIn('批量导入', html)
-        self.assertIn('已保存账号', html)
-        self.assertIn('最新验证码邮件', html)
+        self.assertIn('控制台总览', html)
+        self.assertIn('邮箱管理', html)
+        self.assertIn('API 密钥', html)
+        self.assertIn('项目管理', html)
+        self.assertIn('curl -H "X-API-Key:', html)
         self.assertNotIn('最近记录', html)
 
 if __name__ == '__main__':

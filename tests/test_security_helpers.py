@@ -24,5 +24,35 @@ class SecurityHelperTests(unittest.TestCase):
         self.assertTrue(app.check_password('secret', 'secret'))
         self.assertFalse(app.check_password('secret', 'wrong'))
 
+    def test_encrypt_decrypt_without_data_key_is_plain_compatible(self):
+        raw = 'secret-refresh-token'
+        old = app.DATA_KEY
+        try:
+            app.DATA_KEY = ''
+            self.assertEqual(app.encrypt_secret_value(raw), raw)
+            self.assertEqual(app.decrypt_secret_value(raw), raw)
+        finally:
+            app.DATA_KEY = old
+
+    def test_encrypt_decrypt_with_data_key_roundtrips(self):
+        raw = 'secret-refresh-token'
+        old = app.DATA_KEY
+        try:
+            app.DATA_KEY = 'unit-test-data-key'
+            encrypted = app.encrypt_secret_value(raw)
+            self.assertTrue(encrypted.startswith(app.ENCRYPTED_PREFIX))
+            self.assertNotIn(raw, encrypted)
+            self.assertEqual(app.decrypt_secret_value(encrypted), raw)
+        finally:
+            app.DATA_KEY = old
+
+    def test_encrypted_marker_without_key_decrypts_to_empty(self):
+        old = app.DATA_KEY
+        try:
+            app.DATA_KEY = ''
+            self.assertEqual(app.decrypt_secret_value('enc:v1:not-a-real-token'), '')
+        finally:
+            app.DATA_KEY = old
+
 if __name__ == '__main__':
     unittest.main()

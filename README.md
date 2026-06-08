@@ -1,96 +1,421 @@
-# Refresh Token 邮件验证码 Web 工具
+# 一点微软工具箱（MS Mail Manager）
 
-一个轻量级自托管 Python Web 工具，用来保存 Microsoft 账号 Refresh Token，并读取最近的验证码邮件。
+一个轻量级、自托管的 Microsoft / Outlook / Hotmail 邮箱管理工具箱，用来管理邮箱账号、Refresh Token、Access Token、验证码邮件、账号状态检测和外部查询 API。
 
-适合场景：
+- 官网/线上入口：`https://token.seoyh.net/`
+- 仓库：`https://github.com/921988379/MS-Mail-Manager`
+- 当前版本：`1.0.0`
+- 版权支持：由 [一点优化](https://www.seoyh.net/) 提供
 
-- 管理多个 Microsoft / Outlook 账号的 Refresh Token
-- 通过 Microsoft Graph `Mail.Read` 读取收件箱和垃圾邮箱中的验证码邮件
-- 在 Graph 不可用时回退到 IMAP XOAUTH2
-- 在一个简单网页里查看已保存账号、批量导入账号、刷新验证码邮件
+> 安全提醒：本项目会处理邮箱密码、Refresh Token、Access Token、验证码邮件等敏感数据。请只部署在自己可信服务器上，并妥善保存 `RTWEB_DATA_KEY`、数据库和环境变量文件。
 
-## 功能
+## 功能特色
 
-- 基于 Python 标准库实现的单文件 HTTP 服务
-- 使用 SQLite 保存账号数据
-- 支持 Microsoft OAuth Refresh Token 换取 Access Token
-- 优先使用 Microsoft Graph `Mail.Read` 检索验证码邮件
-- 支持 IMAP XOAUTH2 兜底
-- 支持保存账号、选择账号、批量导入
-- 支持登录会话 Cookie
-- 内置测试，覆盖 OAuth scope、Graph/IMAP 邮件读取、页面渲染和安全辅助函数
+- 邮箱账号托管：单个/批量导入、分类管理、批量导出、删除账号
+- Refresh Token 管理：检测状态、获取 Access Token、保存轮换后的 Refresh Token
+- 邮件验证码读取：优先 Microsoft Graph，失败后回退 XOAUTH2 IMAP，再使用邮箱密码 IMAP 兜底
+- 账号综合检测：统一检测 token、Graph、密码 IMAP、验证码摘要和最佳来源
+- 批量操作进度条：实时显示总进度、当前处理邮箱、成功/失败数量
+- 状态实时同步：批量执行时当前页面邮箱状态同步更新
+- 外部 API：API Key、scope 权限、限流、调用日志、latest-code/account-status 查询
+- 敏感字段加密：Refresh Token、邮箱密码、辅助密码支持加密存储
+- 自动更新：后台版本页检查 GitHub 最新提交，可选启用安全更新命令
 
-## 安全提醒
+## 快速开始
 
-这个项目会处理非常敏感的数据，例如：
-
-- Refresh Token
-- Access Token
-- 邮箱账号
-- 可选的邮箱密码
-- 验证码邮件内容
-
-请不要提交或公开以下内容：
-
-- `.env`
-- `app.db`
-- `*.db`
-- `*.sqlite`
-- Refresh Token
-- Access Token
-- 邮箱密码
-- 含敏感信息的生产日志
-
-建议只部署在自己的私有服务器上，默认绑定 `127.0.0.1`，如果要暴露到公网，请放在带认证的反向代理后面，并设置强密码。
-
-## 配置
-
-支持的环境变量：
-
-- `RTWEB_DB`：SQLite 数据库路径，默认 `app.db`
-- `RTWEB_ADMIN_PASSWORD` 或 `RTWEB_PASSWORD`：后台登录密码，默认 `change-me`
-- `RTWEB_SESSION_SECRET`：会话签名密钥，默认每次进程启动随机生成
-- `RTWEB_HOST`：监听地址，默认 `127.0.0.1`
-- `RTWEB_PORT`：监听端口，默认 `8020`
-- `RTWEB_COOKIE_SECURE`：Cookie 是否只允许 HTTPS；本地 HTTP 开发时可设为 `0`
-
-示例：
+### 1. 克隆项目
 
 ```bash
-export RTWEB_PASSWORD='change-this'
-export RTWEB_SESSION_SECRET='use-a-long-random-secret'
-python3 app.py
+git clone https://github.com/921988379/MS-Mail-Manager.git
+cd MS-Mail-Manager
 ```
 
-本地开发如果没有 HTTPS：
+### 2. 安装依赖
 
 ```bash
-export RTWEB_COOKIE_SECURE=0
-python3 app.py
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-## 批量导入格式
+### 3. 配置环境变量
 
-支持类似下面的格式，每行一个账号：
+复制示例配置：
+
+```bash
+cp .env.example .env
+```
+
+请至少修改：
 
 ```text
-邮箱----密码----Client ID----Refresh Token
+RTWEB_DB=/www/server/rtweb/app.db
+RTWEB_LOGIN_USERNAME=你的登录用户名
+RTWEB_LOGIN_PASSWORD=第一层登录密码
+RTWEB_ADMIN_PASSWORD=第二层管理密码
+RTWEB_SESSION_SECRET=长随机字符串
+RTWEB_DATA_KEY=长随机字符串，务必保存
+RTWEB_API_ALLOW_QUERY_KEY=0
 ```
 
-也兼容不带密码的格式：
+`RTWEB_DATA_KEY` 用于解密数据库里的敏感字段。**丢失后已加密的 Refresh Token / 密码无法恢复。**
+
+### 4. 启动
+
+本地开发：
+
+```bash
+set -a
+source .env
+set +a
+python3 app.py
+```
+
+默认监听：
+
+```text
+http://127.0.0.1:18080
+```
+
+生产环境建议使用 systemd + Nginx HTTPS 反代。
+
+## systemd 部署示例
+
+`/etc/systemd/system/rtweb.service`：
+
+```ini
+[Unit]
+Description=MS Mail Manager
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/www/wwwroot/refresh-token-mail-web
+EnvironmentFile=/www/server/rtweb/rtweb.env
+ExecStart=/usr/bin/python3 /www/wwwroot/refresh-token-mail-web/app.py
+Restart=always
+RestartSec=3
+User=rtweb
+Group=rtweb
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/www/server/rtweb
+
+[Install]
+WantedBy=multi-user.target
+```
+
+启动：
+
+```bash
+systemctl daemon-reload
+systemctl enable --now rtweb
+systemctl status rtweb --no-pager -l
+```
+
+## Nginx 建议
+
+建议启用 HTTPS，并阻止敏感文件访问：
+
+```nginx
+location ~* /(\.git|\.env|.*\.db|.*\.sqlite|.*\.sqlite3) {
+    deny all;
+}
+
+location / {
+    proxy_pass http://127.0.0.1:18080;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_read_timeout 300s;
+    proxy_send_timeout 300s;
+}
+```
+
+## 使用说明
+
+### 登录
+
+后台为双层验证：
+
+1. 用户账号 + 用户密码
+2. 应用管理密码
+
+对应环境变量：
+
+```text
+RTWEB_LOGIN_USERNAME
+RTWEB_LOGIN_PASSWORD
+RTWEB_ADMIN_PASSWORD
+```
+
+### 邮箱导入
+
+入口：`/mailboxes`
+
+批量导入格式：
+
+```text
+邮箱----密码----Client ID----Refresh Token----辅助邮箱----辅助密码----分类
+```
+
+兼容旧格式：
 
 ```text
 邮箱----Client ID----Refresh Token
 ```
 
-页面展示时会对密码和 Token 做打码处理。
+支持分隔符：
+
+```text
+----
+|
+逗号
+Tab
+```
+
+### 令牌管理
+
+入口：`/tokens`
+
+支持：
+
+- 使用 Client ID + Refresh Token 获取 Access Token
+- 检测 Refresh Token 是否可用
+- 保存账号并更新轮换后的 Refresh Token
+- 批量获取、批量刷新、批量检测
+- 进度条显示当前处理邮箱
+
+默认 scope：
+
+```text
+offline_access https://graph.microsoft.com/Mail.Read
+```
+
+### 获取验证码
+
+入口：`/mails`
+
+读取顺序：
+
+```text
+1. Refresh Token -> Access Token
+2. Microsoft Graph 读取收件箱/垃圾箱
+3. XOAUTH2 IMAP 读取收件箱/垃圾箱
+4. 如果令牌失败且保存了密码，则用邮箱密码 IMAP 兜底
+```
+
+### 账号综合检测
+
+入口：邮箱管理里的“综合检测”按钮，或批量操作里的“综合检测”。
+
+判断参考：
+
+| 现象 | 判断 | 建议 |
+| --- | --- | --- |
+| `token_failed + 密码 IMAP 可读` | 令牌挂了，账号未必挂 | 可继续用 IMAP 取码，重新 OAuth 授权刷新令牌 |
+| `token_failed + 密码 IMAP 失败` | 账号/密码/风控可能异常 | 登录 Outlook 网页版验证或重新导入 |
+| `Graph 可读` | 令牌和邮件权限可用 | 可正常用 API 取码 |
+
+### 状态说明
+
+| 状态 | 显示 | 含义 |
+| --- | --- | --- |
+| `token_ok` | 令牌可用 | Refresh Token 能换 Access Token |
+| `token_failed` | 令牌失效 | Refresh Token 不可用 |
+| `graph_ok` | Graph 可读 | Graph Mail.Read 能读取邮件 |
+| `graph_failed` | Graph 失败 | Graph 读取失败 |
+| `xoauth2_imap_ok` | OAuth IMAP 可读 | Access Token 可用于 IMAP XOAUTH2 |
+| `xoauth2_imap_failed` | OAuth IMAP 失败 | XOAUTH2 IMAP 不可用 |
+| `imap_password_ok` | 密码 IMAP 可读 | 邮箱密码可通过 IMAP 读取邮件 |
+| `imap_password_failed` | 密码 IMAP 失败 | 邮箱密码 IMAP 不可用 |
+| `all_failed` | 全部失败 | 所有通道都不可用 |
+
+## 外部 API
+
+推荐只使用请求头传 API Key：
+
+```text
+X-API-Key: ***
+```
+
+线上建议关闭 URL 参数传 key：
+
+```text
+RTWEB_API_ALLOW_QUERY_KEY=0
+```
+
+### 示例
+
+```bash
+curl -H "X-API-Key: ***" "https://token.seoyh.net/api/v1/health"
+
+curl -H "X-API-Key: ***" "https://token.seoyh.net/api/v1/projects"
+
+curl -H "X-API-Key: ***" "https://token.seoyh.net/api/v1/accounts?category=项目名"
+
+curl -H "X-API-Key: ***" "https://token.seoyh.net/api/v1/latest-code?email=xxx@outlook.com"
+
+curl -H "X-API-Key: ***" "https://token.seoyh.net/api/v1/latest-code?category=项目名"
+
+curl -H "X-API-Key: ***" "https://token.seoyh.net/api/v1/account-status?email=xxx@outlook.com"
+
+curl -H "X-API-Key: ***" "https://token.seoyh.net/api/v1/account-status?category=项目名"
+```
+
+### API scopes
+
+| Scope | 用途 |
+| --- | --- |
+| `health` | 健康检查 |
+| `latest_code` | 查询验证码 |
+| `projects` | 查询项目/分类 |
+| `accounts` | 查询账号元数据和状态 |
+
+`/api/v1/account-status` 需要同时具备：
+
+```text
+accounts + latest_code
+```
+
+API 不返回邮箱密码、Refresh Token、Access Token 明文。
+
+## 自动更新功能
+
+后台入口：`/version`
+
+支持：
+
+- 查看当前应用版本
+- 查看当前 Git 分支/commit
+- 查看 GitHub 仓库地址
+- 检查远程最新提交
+- 可选执行更新命令
+
+### 默认安全策略
+
+自动更新默认关闭：
+
+```text
+RTWEB_AUTO_UPDATE_ENABLED=0
+```
+
+这样后台只能“检查更新”，不能直接覆盖线上代码。
+
+### 启用自动更新
+
+确认你已经做好数据库/env 备份，并确认更新命令安全后，再设置：
+
+```text
+RTWEB_AUTO_UPDATE_ENABLED=1
+RTWEB_UPDATE_REPO=https://github.com/921988379/MS-Mail-Manager.git
+RTWEB_UPDATE_BRANCH=main
+RTWEB_UPDATE_COMMAND=./scripts/update.sh
+```
+
+更新脚本：
+
+```bash
+./scripts/update.sh
+```
+
+脚本会执行：
+
+1. `git fetch`
+2. `git pull --ff-only`
+3. `python3 -m py_compile app.py`
+4. 使用临时数据库运行 unittest
+5. 尝试重启 `rtweb` 服务
+
+也可以手动更新：
+
+```bash
+cd /www/wwwroot/refresh-token-mail-web
+git fetch origin main
+git pull --ff-only origin main
+python3 -m py_compile app.py
+TMPDB=$(mktemp /tmp/ms-mail-manager-test-db.XXXXXX)
+rm -f "$TMPDB"
+RTWEB_DB="$TMPDB" python3 -m unittest discover -s tests -p 'test_*.py'
+rm -f "$TMPDB"
+systemctl restart rtweb
+```
+
+## 安全设计
+
+- 后台登录保护
+- 双层密码验证
+- API Key 保护外部 API
+- API Key 只存 SHA-256 digest
+- CSRF 防护
+- 登录失败限流
+- 安全响应头
+- 请求日志脱敏
+- Refresh Token、邮箱密码、辅助密码加密存储
+- 令牌结果默认隐藏，需要点击显示或复制
+- 批量任务并发上限，降低 502 和资源耗尽风险
+- `.env`、数据库、缓存、密钥文件默认不提交
+
+加密字段：
+
+```text
+saved_accounts.refresh_token
+saved_accounts.password
+saved_accounts.aux_password
+```
+
+加密前缀：
+
+```text
+enc:v1:
+```
+
+关键环境变量：
+
+```text
+RTWEB_DATA_KEY
+```
 
 ## 测试
 
+语法检查：
+
 ```bash
-pytest tests -q
+python3 -m py_compile app.py
 ```
 
-## 许可
+使用临时数据库运行测试：
 
-这是一个自托管工具项目。公开使用前请自行补充 License，并自行承担账号与 Token 的安全管理责任。
+```bash
+TMPDB=$(mktemp /tmp/ms-mail-manager-test-db.XXXXXX)
+rm -f "$TMPDB"
+RTWEB_DB="$TMPDB" python3 -m unittest discover -s tests -p 'test_*.py'
+rm -f "$TMPDB"
+```
+
+## 发布前检查清单
+
+```bash
+python3 -m py_compile app.py
+TMPDB=$(mktemp /tmp/ms-mail-manager-test-db.XXXXXX)
+rm -f "$TMPDB"
+RTWEB_DB="$TMPDB" python3 -m unittest discover -s tests -p 'test_*.py'
+rm -f "$TMPDB"
+git status --short
+```
+
+确认不要提交：
+
+- `.env`
+- `app.db`
+- `*.db`
+- `*.sqlite`
+- 生产日志
+- 任何真实 token / 密码 / API Key
+
+## 版权说明
+
+© 一点微软工具箱。技术与优化支持：[一点优化](https://www.seoyh.net/)。

@@ -8,9 +8,9 @@ app = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(app)
 
 class PageFieldTests(unittest.TestCase):
-    def test_home_page_only_exposes_required_inputs(self):
-        with patch.object(app, 'recent_records', return_value=[]), patch.object(app, 'saved_accounts', return_value=[]):
-            html = app.render_home_page()
+    def test_mailboxes_page_exposes_import_fields(self):
+        with patch.object(app, 'saved_accounts', return_value=[]), patch.object(app, 'saved_categories', return_value=[]):
+            html = app.render_mailboxes_page()
         self.assertIn('name="client_id"', html)
         self.assertIn('name="email"', html)
         self.assertIn('name="refresh_token"', html)
