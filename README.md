@@ -4,7 +4,7 @@
 
 - 官网/线上入口：`https://token.seoyh.net/`
 - 仓库：`https://github.com/921988379/MS-Mail-Manager`
-- 当前版本：`1.0.3`
+- 当前版本：`1.0.4`
 - 版权支持：由 [一点优化](https://www.seoyh.net/) 提供
 
 > 安全提醒：本项目会处理邮箱密码、Refresh Token、Access Token、验证码邮件等敏感数据。请只部署在自己可信服务器上，并妥善保存 `RTWEB_DATA_KEY`、数据库和环境变量文件。

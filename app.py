@@ -487,6 +487,48 @@ def status_label(value: str) -> str:
     return labels.get(value or '', value or '')
 
 
+ERROR_FILTERS = {
+    'abuse': '账号风控 / AADSTS70000',
+    'invalid_grant': '令牌失效 / invalid_grant',
+    'consent': '授权或 scope 问题',
+    'imap_disabled': 'IMAP 未开启或不可用',
+    'login_failed': '密码或登录失败',
+    'network': '网络或服务异常',
+    'no_token': '未配置令牌',
+}
+
+
+def error_advice(error_text: str, status: str = ''):
+    text = (error_text or '').strip()
+    low = text.lower()
+    if not text:
+        if status in ('', None):
+            return ('未检测', '还没有检测结果。可先点“综合检测”，确认令牌、Graph、IMAP 和密码通道是否可用。', 'unknown')
+        return ('暂无错误', '当前没有保存最近错误。如状态异常但无错误详情，建议重新执行“综合检测”刷新诊断结果。', 'unknown')
+    if 'aadsts70000' in low or 'service abuse mode' in low or 'abuse' in low:
+        return ('账号风控 / 服务滥用限制', '暂停自动刷新和批量检测；网页登录微软账号完成验证或解锁；解锁后重新授权获取新的 Refresh Token。若无法解锁，建议标记为不可用或更换账号。', 'abuse')
+    if 'invalid_grant' in low or 'refresh token' in low and ('expired' in low or 'revoked' in low or 'invalid' in low):
+        return ('Refresh Token 失效', '重新登录授权获取新的 Refresh Token；如果账号同时触发风控，先网页登录解锁。不要反复用旧 token 重试。', 'invalid_grant')
+    if 'aadsts65001' in low or 'consent' in low or 'permission' in low or 'scope' in low:
+        return ('授权或 scope 不足', '检查 Client ID、授权 scope 和租户；重新授权并确认已授予 Mail.Read / offline_access 等必要权限。', 'consent')
+    if 'imap is disabled' in low or 'imap disabled' in low or 'imap 已禁用' in text or '未连接' in text or 'not connected' in low or 'no mailbox' in low:
+        return ('IMAP 未开启或邮箱未初始化', '网页登录 Outlook 初始化邮箱；确认账号允许 IMAP；如果 OAuth IMAP 不通，可尝试 Graph 或密码 IMAP 兜底。', 'imap_disabled')
+    if 'authentication failed' in low or 'login failed' in low or 'invalid credentials' in low or 'password' in low and ('wrong' in low or 'incorrect' in low):
+        return ('账号密码登录失败', '检查邮箱密码是否正确；确认没有要求安全验证；如果开启两步验证，需要使用应用密码或改用 OAuth 令牌。', 'login_failed')
+    if 'timeout' in low or 'timed out' in low or 'connection reset' in low or 'temporarily unavailable' in low or 'http 5' in low:
+        return ('网络或微软服务异常', '稍后重试；降低批量并发和频率；检查服务器出口 IP、代理和 Microsoft 服务是否临时异常。', 'network')
+    if '未保存邮箱密码' in text or '未配置' in text or 'no token' in low:
+        return ('缺少可用凭证', '补充 Refresh Token 或邮箱密码；如果只需要密码 IMAP，请确认密码已保存且 IMAP 可用。', 'no_token')
+    return ('未知错误', '先执行“综合检测”获取更完整诊断；保留 trace_id / correlation_id 方便排查；如果是单个账号反复失败，建议网页登录确认账号状态。', 'unknown')
+
+
+def error_type_matches(error_text: str, status: str, error_type: str):
+    if not error_type:
+        return True
+    title, advice, code = error_advice(error_text, status)
+    return code == error_type
+
+
 
 
 def normalize_category_name(name: str) -> str:
@@ -1049,40 +1091,68 @@ def saved_accounts(category: str = ''):
         return [decrypt_account_row(r) for r in conn.execute('SELECT * FROM saved_accounts ORDER BY updated_at DESC')]
 
 
-def paged_saved_accounts(category: str = '', page: int = 1, per_page: int = 50):
+def paged_saved_accounts(category: str = '', page: int = 1, per_page: int = 50, status_filter: str = '', error_type: str = '', q: str = ''):
     init_db()
     page = max(1, int(page or 1))
     per_page = int(per_page or 50)
     if per_page not in (20, 50, 100, 200):
         per_page = 50
     offset = (page - 1) * per_page
+    where_parts = []
+    args = []
+    if category:
+        if category == '未分类':
+            where_parts.append("COALESCE(NULLIF(TRIM(category), ''), '未分类')='未分类'")
+        else:
+            where_parts.append('category=?')
+            args.append(category)
+    if status_filter == 'ok':
+        where_parts.append("last_status IN ('ok','token_ok','graph_ok','xoauth2_imap_ok','imap_password_ok')")
+    elif status_filter == 'error':
+        where_parts.append("(last_status IN ('error','token_failed','graph_failed','xoauth2_imap_failed','imap_password_failed','all_failed') OR last_status LIKE '%_failed')")
+    elif status_filter == 'unchecked':
+        where_parts.append("(last_status IS NULL OR TRIM(last_status)='')")
+    elif status_filter:
+        where_parts.append('last_status=?')
+        args.append(status_filter)
+    if q:
+        where_parts.append('(email LIKE ? OR category LIKE ? OR last_error LIKE ?)')
+        like = '%' + q + '%'
+        args.extend([like, like, like])
+    if error_type:
+        # Error types are rule-based and easier to keep correct in Python; prefilter to error-ish rows first.
+        where_parts.append("(last_error IS NOT NULL AND TRIM(last_error)!='')")
+    where_sql = (' WHERE ' + ' AND '.join(where_parts)) if where_parts else ''
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
-        if category:
-            if category == '未分类':
-                where = "COALESCE(NULLIF(TRIM(category), ''), '未分类')='未分类'"
-                total = conn.execute('SELECT COUNT(*) AS n FROM saved_accounts WHERE ' + where).fetchone()['n']
-                rows = list(conn.execute('SELECT * FROM saved_accounts WHERE ' + where + ' ORDER BY updated_at DESC LIMIT ? OFFSET ?', (per_page, offset)))
-            else:
-                total = conn.execute('SELECT COUNT(*) AS n FROM saved_accounts WHERE category=?', (category,)).fetchone()['n']
-                rows = list(conn.execute('SELECT * FROM saved_accounts WHERE category=? ORDER BY updated_at DESC LIMIT ? OFFSET ?', (category, per_page, offset)))
+        if error_type:
+            all_rows = list(conn.execute('SELECT * FROM saved_accounts' + where_sql + ' ORDER BY updated_at DESC', args))
+            matched = [r for r in all_rows if error_type_matches(row_get(r, 'last_error', ''), row_get(r, 'last_status', ''), error_type)]
+            total = len(matched)
+            rows = matched[offset:offset + per_page]
         else:
-            total = conn.execute('SELECT COUNT(*) AS n FROM saved_accounts').fetchone()['n']
-            rows = list(conn.execute('SELECT * FROM saved_accounts ORDER BY updated_at DESC LIMIT ? OFFSET ?', (per_page, offset)))
+            total = conn.execute('SELECT COUNT(*) AS n FROM saved_accounts' + where_sql, args).fetchone()['n']
+            rows = list(conn.execute('SELECT * FROM saved_accounts' + where_sql + ' ORDER BY updated_at DESC LIMIT ? OFFSET ?', args + [per_page, offset]))
     total_pages = max(1, (int(total) + per_page - 1) // per_page)
     if page > total_pages:
-        return paged_saved_accounts(category, total_pages, per_page)
+        return paged_saved_accounts(category, total_pages, per_page, status_filter, error_type, q)
     return {'rows': [decrypt_account_row(r) for r in rows], 'total': int(total), 'page': page, 'per_page': per_page, 'total_pages': total_pages}
 
 
-def mailbox_page_url(category: str = '', page: int = 1, per_page: int = 50):
+def mailbox_page_url(category: str = '', page: int = 1, per_page: int = 50, status_filter: str = '', error_type: str = '', q: str = ''):
     params = {'page': str(max(1, int(page or 1))), 'per_page': str(int(per_page or 50))}
     if category:
         params['category'] = category
+    if status_filter:
+        params['status'] = status_filter
+    if error_type:
+        params['error_type'] = error_type
+    if q:
+        params['q'] = q
     return '/mailboxes?' + urllib.parse.urlencode(params)
 
 
-def render_pagination(meta: dict, category: str = ''):
+def render_pagination(meta: dict, category: str = '', status_filter: str = '', error_type: str = '', q: str = ''):
     total = int(meta.get('total') or 0)
     page = int(meta.get('page') or 1)
     per_page = int(meta.get('per_page') or 50)
@@ -1098,17 +1168,20 @@ def render_pagination(meta: dict, category: str = ''):
         if last and n - last > 1:
             page_links.append('<span class="muted">…</span>')
         cls = 'mini-btn primary' if n == page else 'mini-btn'
-        page_links.append('<a class="' + cls + '" href="' + html.escape(mailbox_page_url(category, n, per_page)) + '">' + str(n) + '</a>')
+        page_links.append('<a class="' + cls + '" href="' + html.escape(mailbox_page_url(category, n, per_page, status_filter, error_type, q)) + '">' + str(n) + '</a>')
         last = n
-    prev_link = '<span class="mini-btn disabled">上一页</span>' if page <= 1 else '<a class="mini-btn" href="' + html.escape(mailbox_page_url(category, page - 1, per_page)) + '">上一页</a>'
-    next_link = '<span class="mini-btn disabled">下一页</span>' if page >= total_pages else '<a class="mini-btn" href="' + html.escape(mailbox_page_url(category, page + 1, per_page)) + '">下一页</a>'
+    prev_link = '<span class="mini-btn disabled">上一页</span>' if page <= 1 else '<a class="mini-btn" href="' + html.escape(mailbox_page_url(category, page - 1, per_page, status_filter, error_type, q)) + '">上一页</a>'
+    next_link = '<span class="mini-btn disabled">下一页</span>' if page >= total_pages else '<a class="mini-btn" href="' + html.escape(mailbox_page_url(category, page + 1, per_page, status_filter, error_type, q)) + '">下一页</a>'
     hidden_category = '<input type="hidden" name="category" value="' + html.escape(category) + '">' if category else ''
+    hidden_status = '<input type="hidden" name="status" value="' + html.escape(status_filter) + '">' if status_filter else ''
+    hidden_error_type = '<input type="hidden" name="error_type" value="' + html.escape(error_type) + '">' if error_type else ''
+    hidden_q = '<input type="hidden" name="q" value="' + html.escape(q) + '">' if q else ''
     return '''
 <div class="pagination-bar">
   <span class="muted">显示 {start}-{end} / 共 {total} 个邮箱，第 {page}/{total_pages} 页</span>
   <span class="bulk-spacer"></span>
   <form method="get" action="/mailboxes" class="action-row" style="gap:6px;margin:0">
-    {hidden_category}
+    {hidden_category}{hidden_status}{hidden_error_type}{hidden_q}
     <select name="per_page" onchange="this.form.submit()">{per_page_options}</select>
     <input name="page" value="{page}" style="width:70px" aria-label="页码">
     <button type="submit" class="mini-btn">跳转</button>
@@ -1116,7 +1189,7 @@ def render_pagination(meta: dict, category: str = ''):
   {prev_link}
   {page_links}
   {next_link}
-</div>'''.format(start=start, end=end, total=total, page=page, total_pages=total_pages, hidden_category=hidden_category, per_page_options=per_page_options, prev_link=prev_link, page_links=''.join(page_links), next_link=next_link)
+</div>'''.format(start=start, end=end, total=total, page=page, total_pages=total_pages, hidden_category=hidden_category, hidden_status=hidden_status, hidden_error_type=hidden_error_type, hidden_q=hidden_q, per_page_options=per_page_options, prev_link=prev_link, page_links=''.join(page_links), next_link=next_link)
 
 
 def get_saved_account(account_id: str):
@@ -1723,7 +1796,7 @@ def extract_card_html(page_html: str) -> str:
     m = re.search(r'<div class="card">(.*)</div>', page_html, re.S)
     return m.group(1) if m else page_html
 
-UI_POLISH_CSS = "\nbody{background:radial-gradient(circle at 18% -8%,#1d4ed833 0,transparent 28rem),radial-gradient(circle at 86% 4%,#7c3aed22 0,transparent 24rem),#070b14;color:#e2e8f0;font-size:14px}.wrap{max-width:1500px;padding:14px}.top{background:#0b1220cc;border:1px solid #263244;border-radius:18px;padding:12px 14px;box-shadow:0 12px 30px #0004;backdrop-filter:blur(10px)}.top h2{font-size:17px;letter-spacing:-.02em}.top a{background:#111827;border:1px solid #334155;border-radius:999px;padding:7px 11px;text-decoration:none;color:#cbd5e1}.top a:hover{border-color:#60a5fa;color:white}.app-layout{grid-template-columns:238px 1fr;gap:14px}.sidebar{background:linear-gradient(180deg,#0b1220f5,#070b14f5);border-color:#263244cc;border-radius:20px;padding:14px}.side-title{font-size:16px;margin:4px 8px 14px}.side-link{background:transparent;border-radius:14px;padding:12px;color:#b6c2d3}.side-link:hover,.side-link.active{background:linear-gradient(135deg,#1d4ed833,#7c3aed22);border-color:#60a5fa66;box-shadow:inset 0 0 0 1px #ffffff08}.app-page-head{display:flex;justify-content:space-between;align-items:flex-end;gap:16px;margin:0 0 14px;padding:18px;border:1px solid #263244;border-radius:20px;background:linear-gradient(135deg,#111827,#0f172a 60%,#172554);box-shadow:0 14px 34px #0004;position:relative;overflow:hidden}.app-page-head:after{content:'';position:absolute;right:-50px;top:-70px;width:210px;height:210px;border-radius:999px;background:#38bdf833;filter:blur(30px)}.app-page-title{position:relative;font-size:24px;font-weight:900;letter-spacing:-.04em;color:#f8fafc}.app-page-subtitle{position:relative;color:#94a3b8;margin-top:6px;line-height:1.6}.app-page-badge{position:relative;border:1px solid #60a5fa55;background:#1d4ed833;color:#dbeafe;border-radius:999px;padding:7px 11px;font-size:12px;font-weight:800;white-space:nowrap}.card{background:linear-gradient(180deg,#101827,#0b1220);border:1px solid #263244cc;border-radius:18px;padding:16px;box-shadow:0 14px 34px #0004}.card h3{font-size:17px;color:#f8fafc;letter-spacing:-.02em;margin-bottom:10px}.card h4{margin:14px 0 8px;color:#dbeafe}.section-grid{grid-template-columns:minmax(330px,420px) 1fr;gap:14px}.section-stack{gap:14px}.muted{color:#94a3b8;line-height:1.65}.ok{color:#86efac}.bad{color:#fca5a5}.notice{border:1px solid #334155;border-radius:14px;padding:12px 13px;margin:10px 0;background:#0f172a;line-height:1.65}.notice.ok{background:linear-gradient(135deg,#052e1699,#0f172a);border-color:#22c55e66;color:#dcfce7}.notice.bad{background:linear-gradient(135deg,#450a0a99,#0f172a);border-color:#ef444466;color:#fee2e2}.notice.info{background:linear-gradient(135deg,#17255499,#0f172a);border-color:#60a5fa66;color:#dbeafe}input,textarea,select{background:#050a14;border-color:#334155;border-radius:12px;padding:10px 11px;transition:border-color .15s,box-shadow .15s,background .15s}input:hover,textarea:hover,select:hover{border-color:#475569}input:focus,textarea:focus,select:focus{outline:0;border-color:#60a5fa;box-shadow:0 0 0 4px #2563eb26;background:#07101f}button,.button-link,.mini-btn{border-radius:11px!important;font-weight:800;box-shadow:0 8px 18px #0002;transition:transform .12s,filter .12s,border-color .12s}button:hover,.button-link:hover,.mini-btn:hover{transform:translateY(-1px);filter:brightness(1.08)}.mini-btn{display:inline-flex!important;align-items:center;justify-content:center;text-decoration:none!important;color:white!important;background:#334155!important;border:1px solid #475569!important}.mini-btn.primary{background:#2563eb!important;border-color:#60a5fa!important}.mini-btn.success{background:#0f766e!important;border-color:#2dd4bf!important}.mini-btn.warning{background:#ea580c!important;border-color:#fdba74!important}.mini-btn.danger{background:#dc2626!important;border-color:#fca5a5!important}.action-row,.toolbar{gap:9px}table{border-collapse:separate;border-spacing:0;width:100%}th{position:sticky;top:0;background:#0b1220;color:#cbd5e1;font-size:12px;font-weight:900;text-transform:none;z-index:1}td,th{border-bottom:1px solid #1f2a3a;padding:8px 7px}tr:hover td{background:#11182799}tr.ok td{background:#052e1644}.scroll{overflow:auto;border-radius:14px}.chip{padding:7px 11px;border-color:#334155;background:#0b1220}.chip.active,.chip:hover{background:linear-gradient(135deg,#2563eb,#7c3aed);border-color:#93c5fd}.category-bar{margin:12px 0 16px}.stat-pill{background:#0b1220cc;border-color:#334155;padding:11px 13px}.tool-card{border-radius:18px}.modal{border-radius:20px}.bulk-bar{background:linear-gradient(135deg,#0f172a,#111827);border-color:#334155;color:#e2e8f0}.selected-preview{background:#0f172a;border-color:#334155;color:#e2e8f0}.code-inline{display:inline-block;padding:2px 7px;border-radius:999px;background:#172554;color:#bfdbfe;border:1px solid #1d4ed8;font-family:ui-monospace,monospace}.mailbox-email{font-weight:800;color:#f8fafc}.mailbox-meta{display:flex;gap:6px;flex-wrap:wrap;margin-top:5px}.status-badge{display:inline-flex;align-items:center;border-radius:999px;padding:4px 8px;font-size:12px;font-weight:900;border:1px solid #334155;background:#0f172a;color:#cbd5e1}.status-badge.ok{border-color:#22c55e66;background:#052e16;color:#bbf7d0}.status-badge.bad{border-color:#ef444466;background:#450a0a;color:#fecaca}.mailbox-detail summary{cursor:pointer;color:#93c5fd;font-weight:800}.detail-grid{display:grid;grid-template-columns:90px 1fr;gap:6px 10px;margin-top:8px;min-width:280px}.detail-label{color:#94a3b8}.detail-value{word-break:break-all}.ops-wrap{display:flex;gap:6px;flex-wrap:wrap;min-width:360px}.table-note{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:8px}.pagination-bar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:8px 0 10px;padding:8px;border:1px solid #263244;border-radius:12px;background:#0b1220}.pagination-bar select,.pagination-bar input{width:auto;margin:0}.pagination-bar .disabled{opacity:.45;pointer-events:none}.mail-search{position:sticky;top:0;background:linear-gradient(180deg,#101827,#101827ee);padding-bottom:10px;z-index:2}.mail-picker-list{display:grid;gap:8px}.mail-picker-item{display:grid;grid-template-columns:1fr auto;gap:6px 10px;text-decoration:none;color:#e2e8f0;border:1px solid #263244;border-radius:14px;padding:10px 11px;background:#0b1220}.mail-picker-item:hover,.mail-picker-item.active{border-color:#60a5fa;background:linear-gradient(135deg,#172554aa,#0b1220)}.mail-picker-email{font-weight:900;word-break:break-all}.mail-picker-meta{font-size:12px;color:#94a3b8}.mail-picker-action{align-self:center;border-radius:999px;background:#1d4ed8;color:#dbeafe;padding:5px 9px;font-size:12px;font-weight:900}.mail-result-top{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:12px}.mail-result-area{display:grid;gap:12px}.mail-summary-card{border:1px solid #334155;border-radius:18px;padding:14px;background:#0f172a}.mail-summary-card.ok{border-color:#22c55e66;background:linear-gradient(135deg,#052e1699,#0f172a)}.mail-summary-card.bad{border-color:#ef444466;background:linear-gradient(135deg,#450a0a99,#0f172a)}.metric-row{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}.metric-chip{border:1px solid #334155;background:#02061780;border-radius:999px;padding:6px 9px;color:#cbd5e1;font-size:12px}.code-grid,.mail-card-grid{display:grid;gap:10px}.code-card,.mail-card{border:1px solid #263244;border-radius:16px;padding:12px;background:#0b1220}.code-card-head{display:flex;justify-content:space-between;align-items:center;gap:10px}.code-pill{font-family:ui-monospace,monospace;font-size:22px;font-weight:900;color:#fef3c7;background:#713f12;border:1px solid #f59e0b66;border-radius:14px;padding:7px 11px;letter-spacing:.04em}.mail-subject{font-weight:900;color:#f8fafc;margin-bottom:5px;word-break:break-word}.mail-preview{color:#cbd5e1;line-height:1.65;margin-top:7px}.empty-state{border:1px dashed #334155;border-radius:18px;padding:22px;text-align:center;background:#0b1220;color:#94a3b8}.progress-shell{display:grid;gap:12px}.progress-track{height:16px;border-radius:999px;background:#020617;border:1px solid #334155;overflow:hidden}.progress-fill{height:100%;width:0;background:linear-gradient(90deg,#2563eb,#22c55e);transition:width .25s}.progress-meta{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}.progress-meta span{border:1px solid #334155;background:#02061780;border-radius:12px;padding:9px;color:#cbd5e1}.progress-current{font-size:15px;word-break:break-all}.progress-email-list{max-height:130px;overflow:auto;border:1px solid #263244;border-radius:12px;padding:8px;background:#0b1220;color:#94a3b8}.progress-email-list div.active{color:#fef3c7;font-weight:900}@media(max-width:900px){.wrap{padding:10px}.app-page-head{display:block;padding:15px}.app-page-badge{display:inline-flex;margin-top:10px}.side-nav{grid-template-columns:1fr 1fr}.section-grid{grid-template-columns:1fr}.card{padding:13px}td,th{padding:7px 6px}}\n"
+UI_POLISH_CSS = "\nbody{background:radial-gradient(circle at 18% -8%,#1d4ed833 0,transparent 28rem),radial-gradient(circle at 86% 4%,#7c3aed22 0,transparent 24rem),#070b14;color:#e2e8f0;font-size:14px}.wrap{max-width:1500px;padding:14px}.top{background:#0b1220cc;border:1px solid #263244;border-radius:18px;padding:12px 14px;box-shadow:0 12px 30px #0004;backdrop-filter:blur(10px)}.top h2{font-size:17px;letter-spacing:-.02em}.top a{background:#111827;border:1px solid #334155;border-radius:999px;padding:7px 11px;text-decoration:none;color:#cbd5e1}.top a:hover{border-color:#60a5fa;color:white}.app-layout{grid-template-columns:238px 1fr;gap:14px}.sidebar{background:linear-gradient(180deg,#0b1220f5,#070b14f5);border-color:#263244cc;border-radius:20px;padding:14px}.side-title{font-size:16px;margin:4px 8px 14px}.side-link{background:transparent;border-radius:14px;padding:12px;color:#b6c2d3}.side-link:hover,.side-link.active{background:linear-gradient(135deg,#1d4ed833,#7c3aed22);border-color:#60a5fa66;box-shadow:inset 0 0 0 1px #ffffff08}.app-page-head{display:flex;justify-content:space-between;align-items:flex-end;gap:16px;margin:0 0 14px;padding:18px;border:1px solid #263244;border-radius:20px;background:linear-gradient(135deg,#111827,#0f172a 60%,#172554);box-shadow:0 14px 34px #0004;position:relative;overflow:hidden}.app-page-head:after{content:'';position:absolute;right:-50px;top:-70px;width:210px;height:210px;border-radius:999px;background:#38bdf833;filter:blur(30px)}.app-page-title{position:relative;font-size:24px;font-weight:900;letter-spacing:-.04em;color:#f8fafc}.app-page-subtitle{position:relative;color:#94a3b8;margin-top:6px;line-height:1.6}.app-page-badge{position:relative;border:1px solid #60a5fa55;background:#1d4ed833;color:#dbeafe;border-radius:999px;padding:7px 11px;font-size:12px;font-weight:800;white-space:nowrap}.card{background:linear-gradient(180deg,#101827,#0b1220);border:1px solid #263244cc;border-radius:18px;padding:16px;box-shadow:0 14px 34px #0004}.card h3{font-size:17px;color:#f8fafc;letter-spacing:-.02em;margin-bottom:10px}.card h4{margin:14px 0 8px;color:#dbeafe}.section-grid{grid-template-columns:minmax(330px,420px) 1fr;gap:14px}.section-stack{gap:14px}.muted{color:#94a3b8;line-height:1.65}.ok{color:#86efac}.bad{color:#fca5a5}.notice{border:1px solid #334155;border-radius:14px;padding:12px 13px;margin:10px 0;background:#0f172a;line-height:1.65}.notice.ok{background:linear-gradient(135deg,#052e1699,#0f172a);border-color:#22c55e66;color:#dcfce7}.notice.bad{background:linear-gradient(135deg,#450a0a99,#0f172a);border-color:#ef444466;color:#fee2e2}.notice.info{background:linear-gradient(135deg,#17255499,#0f172a);border-color:#60a5fa66;color:#dbeafe}input,textarea,select{background:#050a14;border-color:#334155;border-radius:12px;padding:10px 11px;transition:border-color .15s,box-shadow .15s,background .15s}input:hover,textarea:hover,select:hover{border-color:#475569}input:focus,textarea:focus,select:focus{outline:0;border-color:#60a5fa;box-shadow:0 0 0 4px #2563eb26;background:#07101f}button,.button-link,.mini-btn{border-radius:11px!important;font-weight:800;box-shadow:0 8px 18px #0002;transition:transform .12s,filter .12s,border-color .12s}button:hover,.button-link:hover,.mini-btn:hover{transform:translateY(-1px);filter:brightness(1.08)}.mini-btn{display:inline-flex!important;align-items:center;justify-content:center;text-decoration:none!important;color:white!important;background:#334155!important;border:1px solid #475569!important}.mini-btn.primary{background:#2563eb!important;border-color:#60a5fa!important}.mini-btn.success{background:#0f766e!important;border-color:#2dd4bf!important}.mini-btn.warning{background:#ea580c!important;border-color:#fdba74!important}.mini-btn.danger{background:#dc2626!important;border-color:#fca5a5!important}.action-row,.toolbar{gap:9px}table{border-collapse:separate;border-spacing:0;width:100%}th{position:sticky;top:0;background:#0b1220;color:#cbd5e1;font-size:12px;font-weight:900;text-transform:none;z-index:1}td,th{border-bottom:1px solid #1f2a3a;padding:8px 7px}tr:hover td{background:#11182799}tr.ok td{background:#052e1644}.scroll{overflow:auto;border-radius:14px}.chip{padding:7px 11px;border-color:#334155;background:#0b1220}.chip.active,.chip:hover{background:linear-gradient(135deg,#2563eb,#7c3aed);border-color:#93c5fd}.category-bar{margin:12px 0 16px}.stat-pill{background:#0b1220cc;border-color:#334155;padding:11px 13px}.tool-card{border-radius:18px}.modal{border-radius:20px}.bulk-bar{background:linear-gradient(135deg,#0f172a,#111827);border-color:#334155;color:#e2e8f0}.selected-preview{background:#0f172a;border-color:#334155;color:#e2e8f0}.code-inline{display:inline-block;padding:2px 7px;border-radius:999px;background:#172554;color:#bfdbfe;border:1px solid #1d4ed8;font-family:ui-monospace,monospace}.mailbox-email{font-weight:800;color:#f8fafc}.mailbox-meta{display:flex;gap:6px;flex-wrap:wrap;margin-top:5px}.status-badge{display:inline-flex;align-items:center;border-radius:999px;padding:4px 8px;font-size:12px;font-weight:900;border:1px solid #334155;background:#0f172a;color:#cbd5e1}.status-badge.ok{border-color:#22c55e66;background:#052e16;color:#bbf7d0}.status-badge.bad{border-color:#ef444466;background:#450a0a;color:#fecaca}.mailbox-detail summary{cursor:pointer;color:#93c5fd;font-weight:800}.detail-grid{display:grid;grid-template-columns:90px 1fr;gap:6px 10px;margin-top:8px;min-width:280px}.detail-label{color:#94a3b8}.detail-value{word-break:break-all}.ops-wrap{display:flex;gap:6px;flex-wrap:wrap;min-width:360px}.table-note{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:8px}.pagination-bar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:8px 0 10px;padding:8px;border:1px solid #263244;border-radius:12px;background:#0b1220}.pagination-bar select,.pagination-bar input{width:auto;margin:0}.pagination-bar .disabled{opacity:.45;pointer-events:none}.filter-bar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:10px 0 14px;padding:10px;border:1px solid #263244;border-radius:14px;background:#0b1220}.filter-bar input,.filter-bar select{width:auto;margin:0}.mail-search{position:sticky;top:0;background:linear-gradient(180deg,#101827,#101827ee);padding-bottom:10px;z-index:2}.mail-picker-list{display:grid;gap:8px}.mail-picker-item{display:grid;grid-template-columns:1fr auto;gap:6px 10px;text-decoration:none;color:#e2e8f0;border:1px solid #263244;border-radius:14px;padding:10px 11px;background:#0b1220}.mail-picker-item:hover,.mail-picker-item.active{border-color:#60a5fa;background:linear-gradient(135deg,#172554aa,#0b1220)}.mail-picker-email{font-weight:900;word-break:break-all}.mail-picker-meta{font-size:12px;color:#94a3b8}.mail-picker-action{align-self:center;border-radius:999px;background:#1d4ed8;color:#dbeafe;padding:5px 9px;font-size:12px;font-weight:900}.mail-result-top{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:12px}.mail-result-area{display:grid;gap:12px}.mail-summary-card{border:1px solid #334155;border-radius:18px;padding:14px;background:#0f172a}.mail-summary-card.ok{border-color:#22c55e66;background:linear-gradient(135deg,#052e1699,#0f172a)}.mail-summary-card.bad{border-color:#ef444466;background:linear-gradient(135deg,#450a0a99,#0f172a)}.metric-row{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}.metric-chip{border:1px solid #334155;background:#02061780;border-radius:999px;padding:6px 9px;color:#cbd5e1;font-size:12px}.code-grid,.mail-card-grid{display:grid;gap:10px}.code-card,.mail-card{border:1px solid #263244;border-radius:16px;padding:12px;background:#0b1220}.code-card-head{display:flex;justify-content:space-between;align-items:center;gap:10px}.code-pill{font-family:ui-monospace,monospace;font-size:22px;font-weight:900;color:#fef3c7;background:#713f12;border:1px solid #f59e0b66;border-radius:14px;padding:7px 11px;letter-spacing:.04em}.mail-subject{font-weight:900;color:#f8fafc;margin-bottom:5px;word-break:break-word}.mail-preview{color:#cbd5e1;line-height:1.65;margin-top:7px}.empty-state{border:1px dashed #334155;border-radius:18px;padding:22px;text-align:center;background:#0b1220;color:#94a3b8}.progress-shell{display:grid;gap:12px}.progress-track{height:16px;border-radius:999px;background:#020617;border:1px solid #334155;overflow:hidden}.progress-fill{height:100%;width:0;background:linear-gradient(90deg,#2563eb,#22c55e);transition:width .25s}.progress-meta{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}.progress-meta span{border:1px solid #334155;background:#02061780;border-radius:12px;padding:9px;color:#cbd5e1}.progress-current{font-size:15px;word-break:break-all}.progress-email-list{max-height:130px;overflow:auto;border:1px solid #263244;border-radius:12px;padding:8px;background:#0b1220;color:#94a3b8}.progress-email-list div.active{color:#fef3c7;font-weight:900}@media(max-width:900px){.wrap{padding:10px}.app-page-head{display:block;padding:15px}.app-page-badge{display:inline-flex;margin-top:10px}.side-nav{grid-template-columns:1fr 1fr}.section-grid{grid-template-columns:1fr}.card{padding:13px}td,th{padding:7px 6px}}\n"
 
 def page(title, body, show_nav=True, body_class=''):
     nav = '<div class="top"><h2>🧰 一点微软工具箱</h2><a href="/logout">退出</a></div>' if show_nav else ''
@@ -2018,26 +2091,35 @@ def account_status_badge(value: str) -> str:
 
 
 def account_details(a) -> str:
-    err = html.escape((a.get('last_error') or '').strip() or '-')
+    raw_err = (a.get('last_error') or '').strip()
+    err = html.escape(raw_err or '-')
+    advice_title, advice_text, advice_code = error_advice(raw_err, a.get('last_status') or '')
+    advice_html = ''
+    if raw_err or account_status_is_error(a.get('last_status') or ''):
+        advice_html = (
+            '<div class="detail-label">错误类型</div><div class="detail-value"><span class="status-badge bad">' + html.escape(advice_title) + '</span></div>'
+            '<div class="detail-label">处理建议</div><div class="detail-value">' + html.escape(advice_text) + '</div>'
+        )
     return (
         '<details class="mailbox-detail"><summary>详情</summary><div class="detail-grid">'
         '<div class="detail-label">密码</div><div class="detail-value">' + html.escape(a.get('password_mask') or '-') + '</div>'
         '<div class="detail-label">Client ID</div><div class="detail-value"><code>' + html.escape(a.get('client_id') or '-') + '</code></div>'
         '<div class="detail-label">Token</div><div class="detail-value"><code>' + html.escape(a.get('token_mask') or '-') + '</code></div>'
         '<div class="detail-label">最近错误</div><div class="detail-value bad">' + err + '</div>'
+        + advice_html +
         '</div></details>'
     )
 
 
-def render_mailboxes_page(active_account_id: str = '', category_filter: str = '', page_num: int = 1, per_page: int = 50):
-    page_meta = paged_saved_accounts(category_filter, page_num, per_page)
+def render_mailboxes_page(active_account_id: str = '', category_filter: str = '', page_num: int = 1, per_page: int = 50, status_filter: str = '', error_type: str = '', q: str = ''):
+    page_meta = paged_saved_accounts(category_filter, page_num, per_page, status_filter, error_type, q)
     accounts = page_meta['rows']
     categories = saved_categories()
     category_links = ''.join(
-        f'<a class="chip {"active" if c == category_filter else ""}" href="{html.escape(mailbox_page_url(c, 1, page_meta["per_page"]))}">{html.escape(c)}</a>'
+        f'<a class="chip {"active" if c == category_filter else ""}" href="{html.escape(mailbox_page_url(c, 1, page_meta["per_page"], status_filter, error_type, q))}">{html.escape(c)}</a>'
         for c in categories
     )
-    pagination_html = render_pagination(page_meta, category_filter)
+    pagination_html = render_pagination(page_meta, category_filter, status_filter, error_type, q)
     category_options = ''.join(f'<option value="{html.escape(c)}"></option>' for c in categories)
     account_rows = ''.join(
         '<tr class="' + ('ok' if str(a["id"]) == str(active_account_id) else '') + '">'
@@ -2055,7 +2137,32 @@ def render_mailboxes_page(active_account_id: str = '', category_filter: str = ''
   <div class="card">
     <h3>邮箱管理</h3>
     <p class="muted">通过弹窗导入单个或批量 Outlook 邮箱账号，并按分类管理。</p>
-    <div class="category-bar"><a class="chip {'' if category_filter else 'active'}" href="{html.escape(mailbox_page_url('', 1, page_meta['per_page']))}">全部</a>{category_links}</div>
+    <div class="category-bar"><a class="chip {'' if category_filter else 'active'}" href="{html.escape(mailbox_page_url('', 1, page_meta['per_page'], status_filter, error_type, q))}">全部</a>{category_links}</div>
+    <form method="get" action="/mailboxes" class="filter-bar">
+      {('<input type="hidden" name="category" value="' + html.escape(category_filter) + '">') if category_filter else ''}
+      <input name="q" value="{html.escape(q)}" placeholder="搜索邮箱 / 分类 / 错误" style="min-width:220px">
+      <select name="status">
+        <option value="" {"selected" if not status_filter else ""}>全部状态</option>
+        <option value="ok" {"selected" if status_filter == "ok" else ""}>可用</option>
+        <option value="error" {"selected" if status_filter == "error" else ""}>异常</option>
+        <option value="unchecked" {"selected" if status_filter == "unchecked" else ""}>未检测</option>
+        <option value="token_failed" {"selected" if status_filter == "token_failed" else ""}>令牌失效</option>
+        <option value="all_failed" {"selected" if status_filter == "all_failed" else ""}>全部失败</option>
+      </select>
+      <select name="error_type">
+        <option value="" {"selected" if not error_type else ""}>全部错误类型</option>
+        <option value="abuse" {"selected" if error_type == "abuse" else ""}>账号风控 / AADSTS70000</option>
+        <option value="invalid_grant" {"selected" if error_type == "invalid_grant" else ""}>令牌失效</option>
+        <option value="consent" {"selected" if error_type == "consent" else ""}>授权或 scope</option>
+        <option value="imap_disabled" {"selected" if error_type == "imap_disabled" else ""}>IMAP 不可用</option>
+        <option value="login_failed" {"selected" if error_type == "login_failed" else ""}>密码登录失败</option>
+        <option value="network" {"selected" if error_type == "network" else ""}>网络/服务异常</option>
+        <option value="no_token" {"selected" if error_type == "no_token" else ""}>缺少凭证</option>
+      </select>
+      <input type="hidden" name="per_page" value="{page_meta['per_page']}">
+      <button type="submit" class="mini-btn primary">筛选</button>
+      <a class="mini-btn" href="/mailboxes?per_page={page_meta['per_page']}">清空</a>
+    </form>
     <div class="toolbar">
       <button type="button" onclick="openModal('single-import-modal')">单个导入</button>
       <button type="button" style="background:#0f766e" onclick="openModal('batch-import-modal')">批量导入</button>
@@ -2394,7 +2501,7 @@ curl -H "X-API-Key: 你的APIKEY" "https://token.seoyh.net/api/v1/latest-code?ca
 
 
 def render_help_page():
-    content = '<section class="section-stack">\n  <div class="toolbox-hero">\n    <div class="toolbox-kicker">Guide</div>\n    <h1 class="toolbox-title">一点微软工具箱使用说明</h1>\n    <p class="toolbox-desc">推荐流程：导入邮箱 → 检测/刷新令牌 → 综合检测 → 配置项目规则 → 获取验证码/API 调用。本文按实际功能整理，不返回或展示任何账号密码、Refresh Token 明文。</p>\n  </div>\n\n  <div class="quick-actions">\n    <div class="card">\n      <h3>一、导入邮箱</h3>\n      <p class="muted">入口：<code>/mailboxes</code> → “批量导入”。一行一个邮箱。</p>\n      <pre>邮箱----密码----应用ID(Client ID)----Refresh Token----辅助邮箱----辅助密码----分类/项目</pre>\n      <table><tr><th>字段</th><th>是否必填</th><th>说明</th></tr>\n        <tr><td>邮箱</td><td>必填</td><td>Outlook / Hotmail 邮箱地址。</td></tr>\n        <tr><td>密码</td><td>可选</td><td>用于密码 IMAP 兜底读取验证码；不会用于生成 Refresh Token。</td></tr>\n        <tr><td>Client ID</td><td>令牌账号必填</td><td>Microsoft OAuth 应用 ID。</td></tr>\n        <tr><td>Refresh Token</td><td>令牌账号必填</td><td>用于刷新 Access Token，保存后加密入库。</td></tr>\n        <tr><td>辅助邮箱/密码</td><td>可选</td><td>仅作为账号资料保存。</td></tr>\n        <tr><td>分类/项目</td><td>可选</td><td>用于分组、API 按项目取码。</td></tr>\n      </table>\n      <p class="muted">兼容 <code>----</code>、<code>|</code>、逗号、Tab 分隔。旧格式 <code>邮箱----Client ID----Refresh Token</code> 也支持。</p>\n    </div>\n    <div class="card">\n      <h3>二、令牌类型说明</h3>\n      <table><tr><th>类型</th><th>用途</th><th>适合场景</th></tr>\n        <tr><td>Graph 令牌</td><td>通过 Microsoft Graph <code>Mail.Read</code> 读取邮件。</td><td>最推荐，稳定、速度快、可读收件箱和垃圾箱。</td></tr>\n        <tr><td>OAuth IMAP 令牌</td><td>Access Token 通过 IMAP XOAUTH2 登录。</td><td>Graph 不可读时的兼容方案。</td></tr>\n        <tr><td>密码 IMAP</td><td>保存邮箱密码后用 IMAP 直接读取。</td><td>令牌失效时兜底判断账号是否还能收信。</td></tr>\n        <tr><td>无令牌账号</td><td>只保存邮箱/密码/分类。</td><td>不能刷新 token；如有密码可尝试 IMAP 取码。</td></tr>\n      </table>\n      <div class="notice info">系统读取验证码顺序：Graph → OAuth IMAP → 密码 IMAP。综合检测会告诉你哪个通道可用。</div>\n    </div>\n  </div>\n\n  <div class="card"><h3>三、工具能力总览（仓库里已有的工具能力）</h3><p class="muted">下面是后台已经实现并可直接使用的令牌、邮件和批量工具。</p><h3>刷新令牌 / 获取 Access Token</h3>\n    <table><tr><th>功能</th><th>入口</th><th>说明</th></tr>\n      <tr><td>单个刷新</td><td><code>/tokens</code> / <code>/token_tool</code></td><td>输入 Client ID + Refresh Token，换取 Access Token；如 Microsoft 返回新 Refresh Token，会自动轮换保存。</td></tr>\n      <tr><td>批量获取令牌</td><td>邮箱管理 → 批量操作 → 获取令牌</td><td>按勾选邮箱后台执行，显示进度条和当前处理邮箱。</td></tr>\n      <tr><td>批量刷新令牌</td><td>邮箱管理/令牌管理</td><td>后台任务异步执行，避免大批量请求 502。</td></tr>\n      <tr><td>状态检测</td><td>检测状态 / 批量检测</td><td>验证 Refresh Token 是否可换 Access Token，记录 <code>token_ok</code> 或 <code>token_failed</code>。</td></tr>\n    </table>\n    <p class="muted">Token 结果默认隐藏，只提供“显示/复制”按钮，降低误泄露风险。</p>\n  </div>\n\n  <div class="card"><h3>四、获取邮件和验证码</h3>\n    <p>入口：<code>/mails</code> 或外部 API <code>/api/v1/latest-code</code>。</p>\n    <table><tr><th>步骤</th><th>说明</th></tr>\n      <tr><td>1. 选择邮箱</td><td>在邮箱管理里选择当前读取邮箱，或 API 指定 <code>email/category</code>。</td></tr>\n      <tr><td>2. Graph 读取</td><td>用 Refresh Token 换 Access Token 后，通过 Graph 读取收件箱/垃圾邮箱。</td></tr>\n      <tr><td>3. IMAP 兜底</td><td>Graph 失败后尝试 OAuth IMAP；如令牌失败且保存了密码，再尝试密码 IMAP。</td></tr>\n      <tr><td>4. 提取验证码</td><td>从最新邮件主题/摘要中识别验证码，并返回邮件来源、时间、文件夹。</td></tr>\n    </table>\n    <div class="notice info">取不到验证码不一定代表账号挂了：可能是最近没有验证码邮件、规则不匹配、邮件延迟，或 Microsoft 风控。</div>\n  </div>\n\n  <div class="card"><h3>五、项目/分类管理</h3>\n    <p>入口：<code>/project-manage</code>、<code>/categories</code>。</p>\n    <table><tr><th>能力</th><th>用途</th></tr>\n      <tr><td>分类</td><td>给邮箱分组，批量导入时最后一列可直接写分类。</td></tr>\n      <tr><td>项目规则</td><td>按项目配置邮箱组、关键词过滤和返回数量，便于外部系统按项目取码。</td></tr>\n      <tr><td>API 按项目查询</td><td><code>/api/v1/latest-code?category=项目名</code> 可从该项目邮箱中读取验证码。</td></tr>\n      <tr><td>批量改分类</td><td>勾选邮箱后可批量设置分类。</td></tr>\n    </table>\n  </div>\n\n  <div class="card"><h3>六、外部 API 使用</h3>\n    <p class="muted">推荐统一使用请求头传 API Key，不建议 URL 明文传 key。</p>\n    <pre>curl -H "X-API-Key: ***" "https://token.seoyh.net/api/v1/health"\ncurl -H "X-API-Key: ***" "https://token.seoyh.net/api/v1/projects"\ncurl -H "X-API-Key: ***" "https://token.seoyh.net/api/v1/accounts?category=项目名"\ncurl -H "X-API-Key: ***" "https://token.seoyh.net/api/v1/latest-code?email=xxx@outlook.com"\ncurl -H "X-API-Key: ***" "https://token.seoyh.net/api/v1/latest-code?category=项目名"\ncurl -H "X-API-Key: ***" "https://token.seoyh.net/api/v1/account-status?email=xxx@outlook.com"</pre>\n    <table><tr><th>接口</th><th>scope</th><th>说明</th></tr>\n      <tr><td><code>/health</code></td><td><code>health</code></td><td>健康检查。</td></tr>\n      <tr><td><code>/projects</code></td><td><code>projects</code></td><td>返回项目/分类列表。</td></tr>\n      <tr><td><code>/accounts</code></td><td><code>accounts</code></td><td>返回账号元数据和状态，不返回密码/token。</td></tr>\n      <tr><td><code>/latest-code</code></td><td><code>latest_code</code></td><td>读取最新验证码。</td></tr>\n      <tr><td><code>/account-status</code></td><td><code>accounts + latest_code</code></td><td>返回综合状态摘要。</td></tr>\n    </table>\n    <p class="muted">业务失败会返回 <code>ok:false</code> 和错误信息；服务本身正常时尽量不把账号失败伪装成 HTTP 502。</p>\n  </div>\n\n  <div class="card"><h3>七、免导入接口说明</h3>\n    <div class="notice bad">当前版本默认不提供“外部直接传邮箱密码/Refresh Token 的免导入取码接口”。原因是这类接口会让敏感凭证经过 URL、日志或第三方系统，安全风险更高。</div>\n    <p class="muted">推荐做法：先在后台导入并加密保存账号，再通过 API Key + email/category 调用。这样外部系统不需要持有邮箱密码或 Refresh Token。</p>\n  </div>\n\n  <div class="card"><h3>八、状态说明</h3>\n    <table><tr><th>状态</th><th>显示</th><th>含义</th></tr>\n      <tr><td><code>token_ok</code></td><td class="ok">令牌可用</td><td>Refresh Token 能换 Access Token。</td></tr>\n      <tr><td><code>token_failed</code></td><td class="bad">令牌失效</td><td>Refresh Token 失效、scope 未授权或授权过期。</td></tr>\n      <tr><td><code>graph_ok</code></td><td class="ok">Graph 可读</td><td>Graph Mail.Read 能读取邮件。</td></tr>\n      <tr><td><code>graph_failed</code></td><td class="bad">Graph 失败</td><td>Graph 请求失败或权限不足。</td></tr>\n      <tr><td><code>xoauth2_imap_ok</code></td><td class="ok">OAuth IMAP 可读</td><td>Access Token 可用于 IMAP XOAUTH2。</td></tr>\n      <tr><td><code>imap_password_ok</code></td><td class="ok">密码 IMAP 可读</td><td>保存的邮箱密码可以通过 IMAP 读取邮件。</td></tr>\n      <tr><td><code>all_failed</code></td><td class="bad">全部失败</td><td>令牌、Graph、IMAP 通道均不可用。</td></tr>\n    </table>\n  </div>\n\n  <div class="card"><h3>九、常见问题</h3>\n    <table><tr><th>问题</th><th>原因</th><th>处理建议</th></tr>\n      <tr><td><code>invalid_grant</code></td><td>Refresh Token 被撤销、过期或账号安全状态变化。</td><td>重新 OAuth 授权获取新 Refresh Token。</td></tr>\n      <tr><td><code>AADSTS70000</code></td><td>scope 未授权或授权过期。</td><td>系统会兼容旧授权重试；仍失败时重新授权当前 scope。</td></tr>\n      <tr><td>Graph 失败但密码 IMAP 可读</td><td>Graph 权限/令牌异常，账号本身可能还能收信。</td><td>继续用密码 IMAP 兜底，同时重新生成令牌。</td></tr>\n      <tr><td>OAuth IMAP 提示 authenticated but not connected</td><td>账号未初始化 Exchange mailbox 或邮箱服务不可用。</td><td>登录 Outlook 网页版初始化，或改用 Graph/密码 IMAP。</td></tr>\n      <tr><td>API Key 无效</td><td>Key 错误、被禁用或 scope 不足。</td><td>到 API 密钥页检查启用状态、scope 和限流。</td></tr>\n      <tr><td>批量任务很慢</td><td>Microsoft 网络、邮箱数量、IMAP 超时都会影响速度。</td><td>观察进度条；系统已限制并发并异步执行，避免 502。</td></tr>\n    </table>\n  </div>\n\n  <div class="card"><h3>十、安全和备份</h3>\n    <ul>\n      <li>数据库位置建议放在 <code>/www/server/rtweb/app.db</code>，不要放源码目录。</li>\n      <li><code>saved_accounts.refresh_token</code>、<code>password</code>、<code>aux_password</code> 会加密存储。</li>\n      <li>请备份 <code>RTWEB_DATA_KEY</code>，丢失后加密字段无法解密。</li>\n      <li>API Key 只保存 digest，不保存明文；新建后请立即复制。</li>\n      <li>自动更新默认关闭，建议先备份数据库和 env 后再开启。</li>\n      <li>不要把 <code>.env</code>、<code>*.db</code>、真实 token、账号密码提交到仓库。</li>\n    </ul>\n  </div>\n</section>'
+    content = '<section class="section-stack">\n  <div class="toolbox-hero">\n    <div class="toolbox-kicker">Guide</div>\n    <h1 class="toolbox-title">一点微软工具箱使用说明</h1>\n    <p class="toolbox-desc">推荐流程：导入邮箱 → 检测/刷新令牌 → 综合检测 → 配置项目规则 → 获取验证码/API 调用。本文按实际功能整理，不返回或展示任何账号密码、Refresh Token 明文。</p>\n  </div>\n\n  <div class="quick-actions">\n    <div class="card">\n      <h3>一、导入邮箱</h3>\n      <p class="muted">入口：<code>/mailboxes</code> → “批量导入”。一行一个邮箱。</p>\n      <pre>邮箱----密码----应用ID(Client ID)----Refresh Token----辅助邮箱----辅助密码----分类/项目</pre>\n      <table><tr><th>字段</th><th>是否必填</th><th>说明</th></tr>\n        <tr><td>邮箱</td><td>必填</td><td>Outlook / Hotmail 邮箱地址。</td></tr>\n        <tr><td>密码</td><td>可选</td><td>用于密码 IMAP 兜底读取验证码；不会用于生成 Refresh Token。</td></tr>\n        <tr><td>Client ID</td><td>令牌账号必填</td><td>Microsoft OAuth 应用 ID。</td></tr>\n        <tr><td>Refresh Token</td><td>令牌账号必填</td><td>用于刷新 Access Token，保存后加密入库。</td></tr>\n        <tr><td>辅助邮箱/密码</td><td>可选</td><td>仅作为账号资料保存。</td></tr>\n        <tr><td>分类/项目</td><td>可选</td><td>用于分组、API 按项目取码。</td></tr>\n      </table>\n      <p class="muted">兼容 <code>----</code>、<code>|</code>、逗号、Tab 分隔。旧格式 <code>邮箱----Client ID----Refresh Token</code> 也支持。</p>\n    </div>\n    <div class="card">\n      <h3>二、令牌类型说明</h3>\n      <table><tr><th>类型</th><th>用途</th><th>适合场景</th></tr>\n        <tr><td>Graph 令牌</td><td>通过 Microsoft Graph <code>Mail.Read</code> 读取邮件。</td><td>最推荐，稳定、速度快、可读收件箱和垃圾箱。</td></tr>\n        <tr><td>OAuth IMAP 令牌</td><td>Access Token 通过 IMAP XOAUTH2 登录。</td><td>Graph 不可读时的兼容方案。</td></tr>\n        <tr><td>密码 IMAP</td><td>保存邮箱密码后用 IMAP 直接读取。</td><td>令牌失效时兜底判断账号是否还能收信。</td></tr>\n        <tr><td>无令牌账号</td><td>只保存邮箱/密码/分类。</td><td>不能刷新 token；如有密码可尝试 IMAP 取码。</td></tr>\n      </table>\n      <div class="notice info">系统读取验证码顺序：Graph → OAuth IMAP → 密码 IMAP。综合检测会告诉你哪个通道可用。</div>\n    </div>\n  </div>\n\n  <div class="card"><h3>三、工具能力总览（仓库里已有的工具能力）</h3><p class="muted">下面是后台已经实现并可直接使用的令牌、邮件和批量工具。</p><h3>刷新令牌 / 获取 Access Token</h3>\n    <table><tr><th>功能</th><th>入口</th><th>说明</th></tr>\n      <tr><td>单个刷新</td><td><code>/tokens</code> / <code>/token_tool</code></td><td>输入 Client ID + Refresh Token，换取 Access Token；如 Microsoft 返回新 Refresh Token，会自动轮换保存。</td></tr>\n      <tr><td>批量获取令牌</td><td>邮箱管理 → 批量操作 → 获取令牌</td><td>按勾选邮箱后台执行，显示进度条和当前处理邮箱。</td></tr>\n      <tr><td>批量刷新令牌</td><td>邮箱管理/令牌管理</td><td>后台任务异步执行，避免大批量请求 502。</td></tr>\n      <tr><td>状态检测</td><td>检测状态 / 批量检测</td><td>验证 Refresh Token 是否可换 Access Token，记录 <code>token_ok</code> 或 <code>token_failed</code>。</td></tr>\n    </table>\n    <p class="muted">Token 结果默认隐藏，只提供“显示/复制”按钮，降低误泄露风险。</p>\n  </div>\n\n  <div class="card"><h3>四、获取邮件和验证码</h3>\n    <p>入口：<code>/mails</code> 或外部 API <code>/api/v1/latest-code</code>。</p>\n    <table><tr><th>步骤</th><th>说明</th></tr>\n      <tr><td>1. 选择邮箱</td><td>在邮箱管理里选择当前读取邮箱，或 API 指定 <code>email/category</code>。</td></tr>\n      <tr><td>2. Graph 读取</td><td>用 Refresh Token 换 Access Token 后，通过 Graph 读取收件箱/垃圾邮箱。</td></tr>\n      <tr><td>3. IMAP 兜底</td><td>Graph 失败后尝试 OAuth IMAP；如令牌失败且保存了密码，再尝试密码 IMAP。</td></tr>\n      <tr><td>4. 提取验证码</td><td>从最新邮件主题/摘要中识别验证码，并返回邮件来源、时间、文件夹。</td></tr>\n    </table>\n    <div class="notice info">取不到验证码不一定代表账号挂了：可能是最近没有验证码邮件、规则不匹配、邮件延迟，或 Microsoft 风控。</div>\n  </div>\n\n  <div class="card"><h3>五、项目/分类管理</h3>\n    <p>入口：<code>/project-manage</code>、<code>/categories</code>。</p>\n    <table><tr><th>能力</th><th>用途</th></tr>\n      <tr><td>分类</td><td>给邮箱分组，批量导入时最后一列可直接写分类。</td></tr>\n      <tr><td>项目规则</td><td>按项目配置邮箱组、关键词过滤和返回数量，便于外部系统按项目取码。</td></tr>\n      <tr><td>API 按项目查询</td><td><code>/api/v1/latest-code?category=项目名</code> 可从该项目邮箱中读取验证码。</td></tr>\n      <tr><td>批量改分类</td><td>勾选邮箱后可批量设置分类。</td></tr>\n    </table>\n  </div>\n\n  <div class="card"><h3>六、外部 API 使用</h3>\n    <p class="muted">推荐统一使用请求头传 API Key，不建议 URL 明文传 key。</p>\n    <pre>curl -H "X-API-Key: ***" "https://token.seoyh.net/api/v1/health"\ncurl -H "X-API-Key: ***" "https://token.seoyh.net/api/v1/projects"\ncurl -H "X-API-Key: ***" "https://token.seoyh.net/api/v1/accounts?category=项目名"\ncurl -H "X-API-Key: ***" "https://token.seoyh.net/api/v1/latest-code?email=xxx@outlook.com"\ncurl -H "X-API-Key: ***" "https://token.seoyh.net/api/v1/latest-code?category=项目名"\ncurl -H "X-API-Key: ***" "https://token.seoyh.net/api/v1/account-status?email=xxx@outlook.com"</pre>\n    <table><tr><th>接口</th><th>scope</th><th>说明</th></tr>\n      <tr><td><code>/health</code></td><td><code>health</code></td><td>健康检查。</td></tr>\n      <tr><td><code>/projects</code></td><td><code>projects</code></td><td>返回项目/分类列表。</td></tr>\n      <tr><td><code>/accounts</code></td><td><code>accounts</code></td><td>返回账号元数据和状态，不返回密码/token。</td></tr>\n      <tr><td><code>/latest-code</code></td><td><code>latest_code</code></td><td>读取最新验证码。</td></tr>\n      <tr><td><code>/account-status</code></td><td><code>accounts + latest_code</code></td><td>返回综合状态摘要。</td></tr>\n    </table>\n    <p class="muted">业务失败会返回 <code>ok:false</code> 和错误信息；服务本身正常时尽量不把账号失败伪装成 HTTP 502。</p>\n  </div>\n\n  <div class="card"><h3>七、免导入接口说明</h3>\n    <div class="notice bad">当前版本默认不提供“外部直接传邮箱密码/Refresh Token 的免导入取码接口”。原因是这类接口会让敏感凭证经过 URL、日志或第三方系统，安全风险更高。</div>\n    <p class="muted">推荐做法：先在后台导入并加密保存账号，再通过 API Key + email/category 调用。这样外部系统不需要持有邮箱密码或 Refresh Token。</p>\n  </div>\n\n  <div class="card"><h3>八、状态说明</h3>\n    <table><tr><th>状态</th><th>显示</th><th>含义</th></tr>\n      <tr><td><code>token_ok</code></td><td class="ok">令牌可用</td><td>Refresh Token 能换 Access Token。</td></tr>\n      <tr><td><code>token_failed</code></td><td class="bad">令牌失效</td><td>Refresh Token 失效、scope 未授权或授权过期。</td></tr>\n      <tr><td><code>graph_ok</code></td><td class="ok">Graph 可读</td><td>Graph Mail.Read 能读取邮件。</td></tr>\n      <tr><td><code>graph_failed</code></td><td class="bad">Graph 失败</td><td>Graph 请求失败或权限不足。</td></tr>\n      <tr><td><code>xoauth2_imap_ok</code></td><td class="ok">OAuth IMAP 可读</td><td>Access Token 可用于 IMAP XOAUTH2。</td></tr>\n      <tr><td><code>imap_password_ok</code></td><td class="ok">密码 IMAP 可读</td><td>保存的邮箱密码可以通过 IMAP 读取邮件。</td></tr>\n      <tr><td><code>all_failed</code></td><td class="bad">全部失败</td><td>令牌、Graph、IMAP 通道均不可用。</td></tr>\n    </table>\n  </div>\n\n  <div class="card"><h3>九、常见问题</h3>\n    <table><tr><th>问题</th><th>原因</th><th>处理建议</th></tr>\n      <tr><td><code>invalid_grant</code></td><td>Refresh Token 被撤销、过期或账号安全状态变化。</td><td>重新 OAuth 授权获取新 Refresh Token。</td></tr>\n      <tr><td><code>AADSTS70000</code></td><td>账号进入 service abuse mode，通常是微软风控/滥用限制。</td><td>暂停重试，网页登录解锁或验证；解锁后重新授权，无法解锁则标记不可用。</td></tr>\n      <tr><td>Graph 失败但密码 IMAP 可读</td><td>Graph 权限/令牌异常，账号本身可能还能收信。</td><td>继续用密码 IMAP 兜底，同时重新生成令牌。</td></tr>\n      <tr><td>OAuth IMAP 提示 authenticated but not connected</td><td>账号未初始化 Exchange mailbox 或邮箱服务不可用。</td><td>登录 Outlook 网页版初始化，或改用 Graph/密码 IMAP。</td></tr>\n      <tr><td>API Key 无效</td><td>Key 错误、被禁用或 scope 不足。</td><td>到 API 密钥页检查启用状态、scope 和限流。</td></tr>\n      <tr><td>批量任务很慢</td><td>Microsoft 网络、邮箱数量、IMAP 超时都会影响速度。</td><td>观察进度条；系统已限制并发并异步执行，避免 502。</td></tr>\n    </table>\n  </div>\n\n  <div class="card"><h3>十、安全和备份</h3>\n    <ul>\n      <li>数据库位置建议放在 <code>/www/server/rtweb/app.db</code>，不要放源码目录。</li>\n      <li><code>saved_accounts.refresh_token</code>、<code>password</code>、<code>aux_password</code> 会加密存储。</li>\n      <li>请备份 <code>RTWEB_DATA_KEY</code>，丢失后加密字段无法解密。</li>\n      <li>API Key 只保存 digest，不保存明文；新建后请立即复制。</li>\n      <li>自动更新默认关闭，建议先备份数据库和 env 后再开启。</li>\n      <li>不要把 <code>.env</code>、<code>*.db</code>、真实 token、账号密码提交到仓库。</li>\n    </ul>\n  </div>\n</section>'
     return app_page('使用指南', 'help', content)
 
 def render_home_page(active_account_id: str = ''):
@@ -2577,7 +2684,10 @@ class Handler(BaseHTTPRequestHandler):
                 per_page = int(qs.get('per_page', ['50'])[0] or 50)
             except Exception:
                 per_page = 50
-            self.send_html(render_mailboxes_page(get_active_account_id(self.headers.get('Cookie', '')), category_filter, page_num, per_page))
+            status_filter = qs.get('status', [''])[0]
+            error_type = qs.get('error_type', [''])[0]
+            q = qs.get('q', [''])[0].strip()
+            self.send_html(render_mailboxes_page(get_active_account_id(self.headers.get('Cookie', '')), category_filter, page_num, per_page, status_filter, error_type, q))
             return
         if parsed.path == '/tokens':
             self.send_html(render_tokens_page())
