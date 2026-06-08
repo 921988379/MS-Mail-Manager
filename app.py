@@ -936,6 +936,74 @@ def public_project_rows():
             ORDER BY c.name COLLATE NOCASE
         '''))
 
+def render_version_page(message: str = ''):
+    info = version_info(fetch_remote=False)
+    repo_url = html.escape(info.get('release_repo') or RELEASE_REPO_URL)
+    remote_url = html.escape(info.get('remote') or UPDATE_REPO)
+    branch = html.escape(info.get('update_branch') or UPDATE_BRANCH)
+    commit = html.escape(info.get('commit') or 'unknown')
+    latest_commit = html.escape(info.get('latest_commit') or '未检测')
+    behind_raw = str(info.get('behind') or '')
+    behind_text = '未检测' if behind_raw == '' else ('已是最新' if behind_raw == '0' else f'落后 {html.escape(behind_raw)} 个提交')
+    update_badge = '已启用' if info.get('auto_update_enabled') else '未启用'
+    update_cls = 'ok' if info.get('auto_update_enabled') else 'bad'
+    msg_html = ''
+    if message:
+        msg_html = '<div class="card"><h3>操作结果</h3><pre>' + html.escape(message) + '</pre></div>'
+    update_button = (
+        '<button type="submit" class="primary">执行手动更新</button>'
+        if info.get('auto_update_enabled')
+        else '<button type="submit" disabled title="请先设置 RTWEB_AUTO_UPDATE_ENABLED=1">手动更新未启用</button>'
+    )
+    content = f"""
+<section class="section-stack">
+  <div class="toolbox-hero">
+    <div class="toolbox-kicker">⬆️ Version & Update</div>
+    <h1 class="toolbox-title">版本 / 更新</h1>
+    <p class="toolbox-desc">查看当前仓库地址、运行版本、Git 提交和远程更新状态。自动更新默认关闭，避免未经确认的后台代码变更。</p>
+    <div class="toolbox-stats">
+      <span class="stat-pill">当前版本：<b>{html.escape(info.get('version') or APP_VERSION)}</b></span>
+      <span class="stat-pill">当前分支：<b>{html.escape(info.get('branch') or UPDATE_BRANCH)}</b></span>
+      <span class="stat-pill">本地提交：<b>{commit}</b></span>
+      <span class="stat-pill">远程提交：<b>{latest_commit}</b></span>
+      <span class="stat-pill">更新状态：<b>{behind_text}</b></span>
+      <span class="stat-pill">自动更新：<b class="{update_cls}">{update_badge}</b></span>
+    </div>
+  </div>
+
+  {msg_html}
+
+  <div class="quick-actions">
+    <div class="card">
+      <h3>仓库地址</h3>
+      <p><a href="{repo_url}" target="_blank" rel="noopener noreferrer">{repo_url}</a></p>
+      <table>
+        <tr><th>项目</th><th>值</th></tr>
+        <tr><td>Release 仓库</td><td><code>{repo_url}</code></td></tr>
+        <tr><td>Git 远程</td><td><code>{remote_url}</code></td></tr>
+        <tr><td>更新分支</td><td><code>{branch}</code></td></tr>
+        <tr><td>更新命令</td><td><code>{html.escape(UPDATE_COMMAND)}</code></td></tr>
+      </table>
+    </div>
+
+    <div class="card">
+      <h3>更新操作</h3>
+      <p class="muted">“检测更新”只执行 <code>git fetch</code> 并刷新远程提交状态；不会改动当前代码。</p>
+      <form method="post" action="/check-update" class="action-row" style="margin-bottom:10px">
+        <button type="submit" class="primary">检测更新</button>
+        <a class="mini-btn" href="/version">刷新页面</a>
+      </form>
+      <p class="muted">“手动更新”会执行 <code>{html.escape(UPDATE_COMMAND)}</code>。只有环境变量 <code>RTWEB_AUTO_UPDATE_ENABLED=1</code> 时才允许执行。</p>
+      <form method="post" action="/update" class="action-row">
+        {update_button}
+      </form>
+      <div class="notice info" style="margin-top:12px">建议更新前先备份 <code>/www/server/rtweb/app.db</code> 和 <code>/www/server/rtweb/rtweb.env</code>。更新功能不会展示或返回数据库中的密码、Refresh Token、Access Token。</div>
+    </div>
+  </div>
+</section>"""
+    return app_page('版本/更新', 'version', content)
+
+
 
 def get_saved_account_by_email(email_addr: str):
     with sqlite3.connect(DB_PATH) as conn:
@@ -2285,6 +2353,7 @@ def render_home_page(active_account_id: str = ''):
     <a class="tool-card" href="/project-manage"><div class="tool-icon">📁</div><h3>项目管理</h3><p>按项目配置邮箱组、关键词过滤规则和返回数量。</p></a>
     <a class="tool-card" href="/categories"><div class="tool-icon">🏷️</div><h3>分类管理</h3><p>维护邮箱分类，支持批量改分类。</p></a>
     <a class="tool-card" href="/help"><div class="tool-icon">📘</div><h3>使用指南</h3><p>查看导入格式、状态说明和 API 调用方式。</p></a>
+    <a class="tool-card" href="/version"><div class="tool-icon">⬆️</div><h3>版本/更新</h3><p>查看 GitHub 仓库地址、检测远程更新，并在启用后执行手动更新。</p></a>
   </div>
   <div class="quick-actions">
     <div class="card scroll"><h3>最近更新邮箱</h3><table><tr><th>邮箱</th><th>项目/分类</th><th>状态</th><th>错误</th><th>更新时间</th></tr>{recent_rows}</table></div>
