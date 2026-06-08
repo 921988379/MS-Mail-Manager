@@ -874,9 +874,18 @@ def git_output(args, timeout: int = 8):
 
 def version_info(fetch_remote: bool = False):
     if fetch_remote:
-        run_shell_command('git fetch origin ' + sh_quote(UPDATE_BRANCH), timeout=30)
+        run_shell_command('git fetch origin ' + sh_quote(UPDATE_BRANCH) + ' --tags', timeout=30)
     latest_commit = git_output(['rev-parse', '--short', 'origin/' + UPDATE_BRANCH]) or ''
     behind = git_output(['rev-list', '--count', 'HEAD..origin/' + UPDATE_BRANCH]) if latest_commit else ''
+    latest_tag = git_output(['describe', '--tags', '--abbrev=0', 'origin/' + UPDATE_BRANCH]) or git_output(['tag', '--list', 'v*', '--sort=-v:refname']) .splitlines()[0:1]
+    if isinstance(latest_tag, list):
+        latest_tag = latest_tag[0] if latest_tag else ''
+    current_tag = git_output(['describe', '--tags', '--exact-match', 'HEAD']) or ''
+    tag_commit = git_output(['rev-list', '-n', '1', latest_tag]) if latest_tag else ''
+    release_behind = ''
+    if tag_commit:
+        head_commit = git_output(['rev-parse', 'HEAD']) or ''
+        release_behind = '0' if tag_commit == head_commit else (git_output(['rev-list', '--count', 'HEAD..' + latest_tag]) or '')
     return {
         'version': APP_VERSION,
         'branch': git_output(['branch', '--show-current']) or UPDATE_BRANCH,
@@ -886,6 +895,9 @@ def version_info(fetch_remote: bool = False):
         'update_branch': UPDATE_BRANCH,
         'latest_commit': latest_commit,
         'behind': behind,
+        'latest_tag': latest_tag,
+        'current_tag': current_tag,
+        'release_behind': release_behind,
         'auto_update_enabled': AUTO_UPDATE_ENABLED,
     }
 
@@ -943,8 +955,12 @@ def render_version_page(message: str = ''):
     branch = html.escape(info.get('update_branch') or UPDATE_BRANCH)
     commit = html.escape(info.get('commit') or 'unknown')
     latest_commit = html.escape(info.get('latest_commit') or '未检测')
+    latest_tag = html.escape(info.get('latest_tag') or '未检测')
+    current_tag = html.escape(info.get('current_tag') or '未打 tag')
     behind_raw = str(info.get('behind') or '')
     behind_text = '未检测' if behind_raw == '' else ('已是最新' if behind_raw == '0' else f'落后 {html.escape(behind_raw)} 个提交')
+    release_raw = str(info.get('release_behind') or '')
+    release_text = '未检测' if release_raw == '' else ('已是最新 Release' if release_raw == '0' else f'落后最新 Release {html.escape(release_raw)} 个提交')
     update_badge = '已启用' if info.get('auto_update_enabled') else '未启用'
     update_cls = 'ok' if info.get('auto_update_enabled') else 'bad'
     msg_html = ''
@@ -963,10 +979,13 @@ def render_version_page(message: str = ''):
     <p class="toolbox-desc">查看当前仓库地址、运行版本、Git 提交和远程更新状态。自动更新默认关闭，避免未经确认的后台代码变更。</p>
     <div class="toolbox-stats">
       <span class="stat-pill">当前版本：<b>{html.escape(info.get('version') or APP_VERSION)}</b></span>
+      <span class="stat-pill">当前 Release：<b>{current_tag}</b></span>
+      <span class="stat-pill">最新 Release：<b>{latest_tag}</b></span>
+      <span class="stat-pill">Release 状态：<b>{release_text}</b></span>
       <span class="stat-pill">当前分支：<b>{html.escape(info.get('branch') or UPDATE_BRANCH)}</b></span>
       <span class="stat-pill">本地提交：<b>{commit}</b></span>
       <span class="stat-pill">远程提交：<b>{latest_commit}</b></span>
-      <span class="stat-pill">更新状态：<b>{behind_text}</b></span>
+      <span class="stat-pill">分支状态：<b>{behind_text}</b></span>
       <span class="stat-pill">自动更新：<b class="{update_cls}">{update_badge}</b></span>
     </div>
   </div>
@@ -988,7 +1007,7 @@ def render_version_page(message: str = ''):
 
     <div class="card">
       <h3>更新操作</h3>
-      <p class="muted">“检测更新”只执行 <code>git fetch</code> 并刷新远程提交状态；不会改动当前代码。</p>
+      <p class="muted">“检测更新”只执行 <code>git fetch --tags</code>，同时刷新远程分支和最新 Release Tag；不会改动当前代码。</p>
       <form method="post" action="/check-update" class="action-row" style="margin-bottom:10px">
         <button type="submit" class="primary">检测更新</button>
         <a class="mini-btn" href="/version">刷新页面</a>
@@ -2996,8 +3015,12 @@ class Handler(BaseHTTPRequestHandler):
             self.send_html(render_account_inspect_result(result), 200 if (result['token']['ok'] or result['graph_mail']['ok'] or result['password_login']['ok']) else 400)
             return
         if post_path == '/check-update':
-            code, out = run_shell_command('git fetch origin ' + sh_quote(UPDATE_BRANCH), timeout=30)
-            msg = '检查完成。' if code == 0 else ('检查失败：' + out[:500])
+            code, out = run_shell_command('git fetch origin ' + sh_quote(UPDATE_BRANCH) + ' --tags', timeout=30)
+            info = version_info(False)
+            latest_tag = info.get('latest_tag') or '未检测到 Release Tag'
+            release_behind = str(info.get('release_behind') or '')
+            release_status = '未检测' if release_behind == '' else ('已是最新 Release' if release_behind == '0' else '落后最新 Release ' + release_behind + ' 个提交')
+            msg = ('检查完成。最新 Release：' + latest_tag + '；' + release_status) if code == 0 else ('检查失败：' + out[:500])
             self.send_html(render_version_page(msg))
             return
         if post_path == '/update':

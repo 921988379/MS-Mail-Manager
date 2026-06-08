@@ -2,7 +2,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 BRANCH="${RTWEB_UPDATE_BRANCH:-main}"
-git fetch origin "$BRANCH"
+git fetch origin "$BRANCH" --tags
 git pull --ff-only origin "$BRANCH"
 python3 -m py_compile app.py
 TMPDB="$(mktemp /tmp/ms-mail-manager-test-db.XXXXXX)"
