@@ -1049,6 +1049,76 @@ def saved_accounts(category: str = ''):
         return [decrypt_account_row(r) for r in conn.execute('SELECT * FROM saved_accounts ORDER BY updated_at DESC')]
 
 
+def paged_saved_accounts(category: str = '', page: int = 1, per_page: int = 50):
+    init_db()
+    page = max(1, int(page or 1))
+    per_page = int(per_page or 50)
+    if per_page not in (20, 50, 100, 200):
+        per_page = 50
+    offset = (page - 1) * per_page
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        if category:
+            if category == '未分类':
+                where = "COALESCE(NULLIF(TRIM(category), ''), '未分类')='未分类'"
+                total = conn.execute('SELECT COUNT(*) AS n FROM saved_accounts WHERE ' + where).fetchone()['n']
+                rows = list(conn.execute('SELECT * FROM saved_accounts WHERE ' + where + ' ORDER BY updated_at DESC LIMIT ? OFFSET ?', (per_page, offset)))
+            else:
+                total = conn.execute('SELECT COUNT(*) AS n FROM saved_accounts WHERE category=?', (category,)).fetchone()['n']
+                rows = list(conn.execute('SELECT * FROM saved_accounts WHERE category=? ORDER BY updated_at DESC LIMIT ? OFFSET ?', (category, per_page, offset)))
+        else:
+            total = conn.execute('SELECT COUNT(*) AS n FROM saved_accounts').fetchone()['n']
+            rows = list(conn.execute('SELECT * FROM saved_accounts ORDER BY updated_at DESC LIMIT ? OFFSET ?', (per_page, offset)))
+    total_pages = max(1, (int(total) + per_page - 1) // per_page)
+    if page > total_pages:
+        return paged_saved_accounts(category, total_pages, per_page)
+    return {'rows': [decrypt_account_row(r) for r in rows], 'total': int(total), 'page': page, 'per_page': per_page, 'total_pages': total_pages}
+
+
+def mailbox_page_url(category: str = '', page: int = 1, per_page: int = 50):
+    params = {'page': str(max(1, int(page or 1))), 'per_page': str(int(per_page or 50))}
+    if category:
+        params['category'] = category
+    return '/mailboxes?' + urllib.parse.urlencode(params)
+
+
+def render_pagination(meta: dict, category: str = ''):
+    total = int(meta.get('total') or 0)
+    page = int(meta.get('page') or 1)
+    per_page = int(meta.get('per_page') or 50)
+    total_pages = int(meta.get('total_pages') or 1)
+    start = 0 if total == 0 else ((page - 1) * per_page + 1)
+    end = min(total, page * per_page)
+    per_page_options = ''.join('<option value="' + str(n) + '"' + (' selected' if n == per_page else '') + '>每页 ' + str(n) + ' 条</option>' for n in (20, 50, 100, 200))
+    page_links = []
+    last = 0
+    for n in sorted(set([1, total_pages, page - 2, page - 1, page, page + 1, page + 2])):
+        if n < 1 or n > total_pages:
+            continue
+        if last and n - last > 1:
+            page_links.append('<span class="muted">…</span>')
+        cls = 'mini-btn primary' if n == page else 'mini-btn'
+        page_links.append('<a class="' + cls + '" href="' + html.escape(mailbox_page_url(category, n, per_page)) + '">' + str(n) + '</a>')
+        last = n
+    prev_link = '<span class="mini-btn disabled">上一页</span>' if page <= 1 else '<a class="mini-btn" href="' + html.escape(mailbox_page_url(category, page - 1, per_page)) + '">上一页</a>'
+    next_link = '<span class="mini-btn disabled">下一页</span>' if page >= total_pages else '<a class="mini-btn" href="' + html.escape(mailbox_page_url(category, page + 1, per_page)) + '">下一页</a>'
+    hidden_category = '<input type="hidden" name="category" value="' + html.escape(category) + '">' if category else ''
+    return '''
+<div class="pagination-bar">
+  <span class="muted">显示 {start}-{end} / 共 {total} 个邮箱，第 {page}/{total_pages} 页</span>
+  <span class="bulk-spacer"></span>
+  <form method="get" action="/mailboxes" class="action-row" style="gap:6px;margin:0">
+    {hidden_category}
+    <select name="per_page" onchange="this.form.submit()">{per_page_options}</select>
+    <input name="page" value="{page}" style="width:70px" aria-label="页码">
+    <button type="submit" class="mini-btn">跳转</button>
+  </form>
+  {prev_link}
+  {page_links}
+  {next_link}
+</div>'''.format(start=start, end=end, total=total, page=page, total_pages=total_pages, hidden_category=hidden_category, per_page_options=per_page_options, prev_link=prev_link, page_links=''.join(page_links), next_link=next_link)
+
+
 def get_saved_account(account_id: str):
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
@@ -1653,7 +1723,7 @@ def extract_card_html(page_html: str) -> str:
     m = re.search(r'<div class="card">(.*)</div>', page_html, re.S)
     return m.group(1) if m else page_html
 
-UI_POLISH_CSS = "\nbody{background:radial-gradient(circle at 18% -8%,#1d4ed833 0,transparent 28rem),radial-gradient(circle at 86% 4%,#7c3aed22 0,transparent 24rem),#070b14;color:#e2e8f0;font-size:14px}.wrap{max-width:1500px;padding:14px}.top{background:#0b1220cc;border:1px solid #263244;border-radius:18px;padding:12px 14px;box-shadow:0 12px 30px #0004;backdrop-filter:blur(10px)}.top h2{font-size:17px;letter-spacing:-.02em}.top a{background:#111827;border:1px solid #334155;border-radius:999px;padding:7px 11px;text-decoration:none;color:#cbd5e1}.top a:hover{border-color:#60a5fa;color:white}.app-layout{grid-template-columns:238px 1fr;gap:14px}.sidebar{background:linear-gradient(180deg,#0b1220f5,#070b14f5);border-color:#263244cc;border-radius:20px;padding:14px}.side-title{font-size:16px;margin:4px 8px 14px}.side-link{background:transparent;border-radius:14px;padding:12px;color:#b6c2d3}.side-link:hover,.side-link.active{background:linear-gradient(135deg,#1d4ed833,#7c3aed22);border-color:#60a5fa66;box-shadow:inset 0 0 0 1px #ffffff08}.app-page-head{display:flex;justify-content:space-between;align-items:flex-end;gap:16px;margin:0 0 14px;padding:18px;border:1px solid #263244;border-radius:20px;background:linear-gradient(135deg,#111827,#0f172a 60%,#172554);box-shadow:0 14px 34px #0004;position:relative;overflow:hidden}.app-page-head:after{content:'';position:absolute;right:-50px;top:-70px;width:210px;height:210px;border-radius:999px;background:#38bdf833;filter:blur(30px)}.app-page-title{position:relative;font-size:24px;font-weight:900;letter-spacing:-.04em;color:#f8fafc}.app-page-subtitle{position:relative;color:#94a3b8;margin-top:6px;line-height:1.6}.app-page-badge{position:relative;border:1px solid #60a5fa55;background:#1d4ed833;color:#dbeafe;border-radius:999px;padding:7px 11px;font-size:12px;font-weight:800;white-space:nowrap}.card{background:linear-gradient(180deg,#101827,#0b1220);border:1px solid #263244cc;border-radius:18px;padding:16px;box-shadow:0 14px 34px #0004}.card h3{font-size:17px;color:#f8fafc;letter-spacing:-.02em;margin-bottom:10px}.card h4{margin:14px 0 8px;color:#dbeafe}.section-grid{grid-template-columns:minmax(330px,420px) 1fr;gap:14px}.section-stack{gap:14px}.muted{color:#94a3b8;line-height:1.65}.ok{color:#86efac}.bad{color:#fca5a5}.notice{border:1px solid #334155;border-radius:14px;padding:12px 13px;margin:10px 0;background:#0f172a;line-height:1.65}.notice.ok{background:linear-gradient(135deg,#052e1699,#0f172a);border-color:#22c55e66;color:#dcfce7}.notice.bad{background:linear-gradient(135deg,#450a0a99,#0f172a);border-color:#ef444466;color:#fee2e2}.notice.info{background:linear-gradient(135deg,#17255499,#0f172a);border-color:#60a5fa66;color:#dbeafe}input,textarea,select{background:#050a14;border-color:#334155;border-radius:12px;padding:10px 11px;transition:border-color .15s,box-shadow .15s,background .15s}input:hover,textarea:hover,select:hover{border-color:#475569}input:focus,textarea:focus,select:focus{outline:0;border-color:#60a5fa;box-shadow:0 0 0 4px #2563eb26;background:#07101f}button,.button-link,.mini-btn{border-radius:11px!important;font-weight:800;box-shadow:0 8px 18px #0002;transition:transform .12s,filter .12s,border-color .12s}button:hover,.button-link:hover,.mini-btn:hover{transform:translateY(-1px);filter:brightness(1.08)}.mini-btn{display:inline-flex!important;align-items:center;justify-content:center;text-decoration:none!important;color:white!important;background:#334155!important;border:1px solid #475569!important}.mini-btn.primary{background:#2563eb!important;border-color:#60a5fa!important}.mini-btn.success{background:#0f766e!important;border-color:#2dd4bf!important}.mini-btn.warning{background:#ea580c!important;border-color:#fdba74!important}.mini-btn.danger{background:#dc2626!important;border-color:#fca5a5!important}.action-row,.toolbar{gap:9px}table{border-collapse:separate;border-spacing:0;width:100%}th{position:sticky;top:0;background:#0b1220;color:#cbd5e1;font-size:12px;font-weight:900;text-transform:none;z-index:1}td,th{border-bottom:1px solid #1f2a3a;padding:8px 7px}tr:hover td{background:#11182799}tr.ok td{background:#052e1644}.scroll{overflow:auto;border-radius:14px}.chip{padding:7px 11px;border-color:#334155;background:#0b1220}.chip.active,.chip:hover{background:linear-gradient(135deg,#2563eb,#7c3aed);border-color:#93c5fd}.category-bar{margin:12px 0 16px}.stat-pill{background:#0b1220cc;border-color:#334155;padding:11px 13px}.tool-card{border-radius:18px}.modal{border-radius:20px}.bulk-bar{background:linear-gradient(135deg,#0f172a,#111827);border-color:#334155;color:#e2e8f0}.selected-preview{background:#0f172a;border-color:#334155;color:#e2e8f0}.code-inline{display:inline-block;padding:2px 7px;border-radius:999px;background:#172554;color:#bfdbfe;border:1px solid #1d4ed8;font-family:ui-monospace,monospace}.mailbox-email{font-weight:800;color:#f8fafc}.mailbox-meta{display:flex;gap:6px;flex-wrap:wrap;margin-top:5px}.status-badge{display:inline-flex;align-items:center;border-radius:999px;padding:4px 8px;font-size:12px;font-weight:900;border:1px solid #334155;background:#0f172a;color:#cbd5e1}.status-badge.ok{border-color:#22c55e66;background:#052e16;color:#bbf7d0}.status-badge.bad{border-color:#ef444466;background:#450a0a;color:#fecaca}.mailbox-detail summary{cursor:pointer;color:#93c5fd;font-weight:800}.detail-grid{display:grid;grid-template-columns:90px 1fr;gap:6px 10px;margin-top:8px;min-width:280px}.detail-label{color:#94a3b8}.detail-value{word-break:break-all}.ops-wrap{display:flex;gap:6px;flex-wrap:wrap;min-width:360px}.table-note{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:8px}.mail-search{position:sticky;top:0;background:linear-gradient(180deg,#101827,#101827ee);padding-bottom:10px;z-index:2}.mail-picker-list{display:grid;gap:8px}.mail-picker-item{display:grid;grid-template-columns:1fr auto;gap:6px 10px;text-decoration:none;color:#e2e8f0;border:1px solid #263244;border-radius:14px;padding:10px 11px;background:#0b1220}.mail-picker-item:hover,.mail-picker-item.active{border-color:#60a5fa;background:linear-gradient(135deg,#172554aa,#0b1220)}.mail-picker-email{font-weight:900;word-break:break-all}.mail-picker-meta{font-size:12px;color:#94a3b8}.mail-picker-action{align-self:center;border-radius:999px;background:#1d4ed8;color:#dbeafe;padding:5px 9px;font-size:12px;font-weight:900}.mail-result-top{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:12px}.mail-result-area{display:grid;gap:12px}.mail-summary-card{border:1px solid #334155;border-radius:18px;padding:14px;background:#0f172a}.mail-summary-card.ok{border-color:#22c55e66;background:linear-gradient(135deg,#052e1699,#0f172a)}.mail-summary-card.bad{border-color:#ef444466;background:linear-gradient(135deg,#450a0a99,#0f172a)}.metric-row{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}.metric-chip{border:1px solid #334155;background:#02061780;border-radius:999px;padding:6px 9px;color:#cbd5e1;font-size:12px}.code-grid,.mail-card-grid{display:grid;gap:10px}.code-card,.mail-card{border:1px solid #263244;border-radius:16px;padding:12px;background:#0b1220}.code-card-head{display:flex;justify-content:space-between;align-items:center;gap:10px}.code-pill{font-family:ui-monospace,monospace;font-size:22px;font-weight:900;color:#fef3c7;background:#713f12;border:1px solid #f59e0b66;border-radius:14px;padding:7px 11px;letter-spacing:.04em}.mail-subject{font-weight:900;color:#f8fafc;margin-bottom:5px;word-break:break-word}.mail-preview{color:#cbd5e1;line-height:1.65;margin-top:7px}.empty-state{border:1px dashed #334155;border-radius:18px;padding:22px;text-align:center;background:#0b1220;color:#94a3b8}.progress-shell{display:grid;gap:12px}.progress-track{height:16px;border-radius:999px;background:#020617;border:1px solid #334155;overflow:hidden}.progress-fill{height:100%;width:0;background:linear-gradient(90deg,#2563eb,#22c55e);transition:width .25s}.progress-meta{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}.progress-meta span{border:1px solid #334155;background:#02061780;border-radius:12px;padding:9px;color:#cbd5e1}.progress-current{font-size:15px;word-break:break-all}.progress-email-list{max-height:130px;overflow:auto;border:1px solid #263244;border-radius:12px;padding:8px;background:#0b1220;color:#94a3b8}.progress-email-list div.active{color:#fef3c7;font-weight:900}@media(max-width:900px){.wrap{padding:10px}.app-page-head{display:block;padding:15px}.app-page-badge{display:inline-flex;margin-top:10px}.side-nav{grid-template-columns:1fr 1fr}.section-grid{grid-template-columns:1fr}.card{padding:13px}td,th{padding:7px 6px}}\n"
+UI_POLISH_CSS = "\nbody{background:radial-gradient(circle at 18% -8%,#1d4ed833 0,transparent 28rem),radial-gradient(circle at 86% 4%,#7c3aed22 0,transparent 24rem),#070b14;color:#e2e8f0;font-size:14px}.wrap{max-width:1500px;padding:14px}.top{background:#0b1220cc;border:1px solid #263244;border-radius:18px;padding:12px 14px;box-shadow:0 12px 30px #0004;backdrop-filter:blur(10px)}.top h2{font-size:17px;letter-spacing:-.02em}.top a{background:#111827;border:1px solid #334155;border-radius:999px;padding:7px 11px;text-decoration:none;color:#cbd5e1}.top a:hover{border-color:#60a5fa;color:white}.app-layout{grid-template-columns:238px 1fr;gap:14px}.sidebar{background:linear-gradient(180deg,#0b1220f5,#070b14f5);border-color:#263244cc;border-radius:20px;padding:14px}.side-title{font-size:16px;margin:4px 8px 14px}.side-link{background:transparent;border-radius:14px;padding:12px;color:#b6c2d3}.side-link:hover,.side-link.active{background:linear-gradient(135deg,#1d4ed833,#7c3aed22);border-color:#60a5fa66;box-shadow:inset 0 0 0 1px #ffffff08}.app-page-head{display:flex;justify-content:space-between;align-items:flex-end;gap:16px;margin:0 0 14px;padding:18px;border:1px solid #263244;border-radius:20px;background:linear-gradient(135deg,#111827,#0f172a 60%,#172554);box-shadow:0 14px 34px #0004;position:relative;overflow:hidden}.app-page-head:after{content:'';position:absolute;right:-50px;top:-70px;width:210px;height:210px;border-radius:999px;background:#38bdf833;filter:blur(30px)}.app-page-title{position:relative;font-size:24px;font-weight:900;letter-spacing:-.04em;color:#f8fafc}.app-page-subtitle{position:relative;color:#94a3b8;margin-top:6px;line-height:1.6}.app-page-badge{position:relative;border:1px solid #60a5fa55;background:#1d4ed833;color:#dbeafe;border-radius:999px;padding:7px 11px;font-size:12px;font-weight:800;white-space:nowrap}.card{background:linear-gradient(180deg,#101827,#0b1220);border:1px solid #263244cc;border-radius:18px;padding:16px;box-shadow:0 14px 34px #0004}.card h3{font-size:17px;color:#f8fafc;letter-spacing:-.02em;margin-bottom:10px}.card h4{margin:14px 0 8px;color:#dbeafe}.section-grid{grid-template-columns:minmax(330px,420px) 1fr;gap:14px}.section-stack{gap:14px}.muted{color:#94a3b8;line-height:1.65}.ok{color:#86efac}.bad{color:#fca5a5}.notice{border:1px solid #334155;border-radius:14px;padding:12px 13px;margin:10px 0;background:#0f172a;line-height:1.65}.notice.ok{background:linear-gradient(135deg,#052e1699,#0f172a);border-color:#22c55e66;color:#dcfce7}.notice.bad{background:linear-gradient(135deg,#450a0a99,#0f172a);border-color:#ef444466;color:#fee2e2}.notice.info{background:linear-gradient(135deg,#17255499,#0f172a);border-color:#60a5fa66;color:#dbeafe}input,textarea,select{background:#050a14;border-color:#334155;border-radius:12px;padding:10px 11px;transition:border-color .15s,box-shadow .15s,background .15s}input:hover,textarea:hover,select:hover{border-color:#475569}input:focus,textarea:focus,select:focus{outline:0;border-color:#60a5fa;box-shadow:0 0 0 4px #2563eb26;background:#07101f}button,.button-link,.mini-btn{border-radius:11px!important;font-weight:800;box-shadow:0 8px 18px #0002;transition:transform .12s,filter .12s,border-color .12s}button:hover,.button-link:hover,.mini-btn:hover{transform:translateY(-1px);filter:brightness(1.08)}.mini-btn{display:inline-flex!important;align-items:center;justify-content:center;text-decoration:none!important;color:white!important;background:#334155!important;border:1px solid #475569!important}.mini-btn.primary{background:#2563eb!important;border-color:#60a5fa!important}.mini-btn.success{background:#0f766e!important;border-color:#2dd4bf!important}.mini-btn.warning{background:#ea580c!important;border-color:#fdba74!important}.mini-btn.danger{background:#dc2626!important;border-color:#fca5a5!important}.action-row,.toolbar{gap:9px}table{border-collapse:separate;border-spacing:0;width:100%}th{position:sticky;top:0;background:#0b1220;color:#cbd5e1;font-size:12px;font-weight:900;text-transform:none;z-index:1}td,th{border-bottom:1px solid #1f2a3a;padding:8px 7px}tr:hover td{background:#11182799}tr.ok td{background:#052e1644}.scroll{overflow:auto;border-radius:14px}.chip{padding:7px 11px;border-color:#334155;background:#0b1220}.chip.active,.chip:hover{background:linear-gradient(135deg,#2563eb,#7c3aed);border-color:#93c5fd}.category-bar{margin:12px 0 16px}.stat-pill{background:#0b1220cc;border-color:#334155;padding:11px 13px}.tool-card{border-radius:18px}.modal{border-radius:20px}.bulk-bar{background:linear-gradient(135deg,#0f172a,#111827);border-color:#334155;color:#e2e8f0}.selected-preview{background:#0f172a;border-color:#334155;color:#e2e8f0}.code-inline{display:inline-block;padding:2px 7px;border-radius:999px;background:#172554;color:#bfdbfe;border:1px solid #1d4ed8;font-family:ui-monospace,monospace}.mailbox-email{font-weight:800;color:#f8fafc}.mailbox-meta{display:flex;gap:6px;flex-wrap:wrap;margin-top:5px}.status-badge{display:inline-flex;align-items:center;border-radius:999px;padding:4px 8px;font-size:12px;font-weight:900;border:1px solid #334155;background:#0f172a;color:#cbd5e1}.status-badge.ok{border-color:#22c55e66;background:#052e16;color:#bbf7d0}.status-badge.bad{border-color:#ef444466;background:#450a0a;color:#fecaca}.mailbox-detail summary{cursor:pointer;color:#93c5fd;font-weight:800}.detail-grid{display:grid;grid-template-columns:90px 1fr;gap:6px 10px;margin-top:8px;min-width:280px}.detail-label{color:#94a3b8}.detail-value{word-break:break-all}.ops-wrap{display:flex;gap:6px;flex-wrap:wrap;min-width:360px}.table-note{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:8px}.pagination-bar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:8px 0 10px;padding:8px;border:1px solid #263244;border-radius:12px;background:#0b1220}.pagination-bar select,.pagination-bar input{width:auto;margin:0}.pagination-bar .disabled{opacity:.45;pointer-events:none}.mail-search{position:sticky;top:0;background:linear-gradient(180deg,#101827,#101827ee);padding-bottom:10px;z-index:2}.mail-picker-list{display:grid;gap:8px}.mail-picker-item{display:grid;grid-template-columns:1fr auto;gap:6px 10px;text-decoration:none;color:#e2e8f0;border:1px solid #263244;border-radius:14px;padding:10px 11px;background:#0b1220}.mail-picker-item:hover,.mail-picker-item.active{border-color:#60a5fa;background:linear-gradient(135deg,#172554aa,#0b1220)}.mail-picker-email{font-weight:900;word-break:break-all}.mail-picker-meta{font-size:12px;color:#94a3b8}.mail-picker-action{align-self:center;border-radius:999px;background:#1d4ed8;color:#dbeafe;padding:5px 9px;font-size:12px;font-weight:900}.mail-result-top{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:12px}.mail-result-area{display:grid;gap:12px}.mail-summary-card{border:1px solid #334155;border-radius:18px;padding:14px;background:#0f172a}.mail-summary-card.ok{border-color:#22c55e66;background:linear-gradient(135deg,#052e1699,#0f172a)}.mail-summary-card.bad{border-color:#ef444466;background:linear-gradient(135deg,#450a0a99,#0f172a)}.metric-row{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}.metric-chip{border:1px solid #334155;background:#02061780;border-radius:999px;padding:6px 9px;color:#cbd5e1;font-size:12px}.code-grid,.mail-card-grid{display:grid;gap:10px}.code-card,.mail-card{border:1px solid #263244;border-radius:16px;padding:12px;background:#0b1220}.code-card-head{display:flex;justify-content:space-between;align-items:center;gap:10px}.code-pill{font-family:ui-monospace,monospace;font-size:22px;font-weight:900;color:#fef3c7;background:#713f12;border:1px solid #f59e0b66;border-radius:14px;padding:7px 11px;letter-spacing:.04em}.mail-subject{font-weight:900;color:#f8fafc;margin-bottom:5px;word-break:break-word}.mail-preview{color:#cbd5e1;line-height:1.65;margin-top:7px}.empty-state{border:1px dashed #334155;border-radius:18px;padding:22px;text-align:center;background:#0b1220;color:#94a3b8}.progress-shell{display:grid;gap:12px}.progress-track{height:16px;border-radius:999px;background:#020617;border:1px solid #334155;overflow:hidden}.progress-fill{height:100%;width:0;background:linear-gradient(90deg,#2563eb,#22c55e);transition:width .25s}.progress-meta{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}.progress-meta span{border:1px solid #334155;background:#02061780;border-radius:12px;padding:9px;color:#cbd5e1}.progress-current{font-size:15px;word-break:break-all}.progress-email-list{max-height:130px;overflow:auto;border:1px solid #263244;border-radius:12px;padding:8px;background:#0b1220;color:#94a3b8}.progress-email-list div.active{color:#fef3c7;font-weight:900}@media(max-width:900px){.wrap{padding:10px}.app-page-head{display:block;padding:15px}.app-page-badge{display:inline-flex;margin-top:10px}.side-nav{grid-template-columns:1fr 1fr}.section-grid{grid-template-columns:1fr}.card{padding:13px}td,th{padding:7px 6px}}\n"
 
 def page(title, body, show_nav=True, body_class=''):
     nav = '<div class="top"><h2>🧰 一点微软工具箱</h2><a href="/logout">退出</a></div>' if show_nav else ''
@@ -1959,13 +2029,15 @@ def account_details(a) -> str:
     )
 
 
-def render_mailboxes_page(active_account_id: str = '', category_filter: str = ''):
-    accounts = saved_accounts(category_filter)
+def render_mailboxes_page(active_account_id: str = '', category_filter: str = '', page_num: int = 1, per_page: int = 50):
+    page_meta = paged_saved_accounts(category_filter, page_num, per_page)
+    accounts = page_meta['rows']
     categories = saved_categories()
     category_links = ''.join(
-        f'<a class="chip {"active" if c == category_filter else ""}" href="/mailboxes?category={urllib.parse.quote(c)}">{html.escape(c)}</a>'
+        f'<a class="chip {"active" if c == category_filter else ""}" href="{html.escape(mailbox_page_url(c, 1, page_meta["per_page"]))}">{html.escape(c)}</a>'
         for c in categories
     )
+    pagination_html = render_pagination(page_meta, category_filter)
     category_options = ''.join(f'<option value="{html.escape(c)}"></option>' for c in categories)
     account_rows = ''.join(
         '<tr class="' + ('ok' if str(a["id"]) == str(active_account_id) else '') + '">'
@@ -1983,7 +2055,7 @@ def render_mailboxes_page(active_account_id: str = '', category_filter: str = ''
   <div class="card">
     <h3>邮箱管理</h3>
     <p class="muted">通过弹窗导入单个或批量 Outlook 邮箱账号，并按分类管理。</p>
-    <div class="category-bar"><a class="chip {'' if category_filter else 'active'}" href="/mailboxes">全部</a>{category_links}</div>
+    <div class="category-bar"><a class="chip {'' if category_filter else 'active'}" href="{html.escape(mailbox_page_url('', 1, page_meta['per_page']))}">全部</a>{category_links}</div>
     <div class="toolbar">
       <button type="button" onclick="openModal('single-import-modal')">单个导入</button>
       <button type="button" style="background:#0f766e" onclick="openModal('batch-import-modal')">批量导入</button>
@@ -1999,15 +2071,17 @@ def render_mailboxes_page(active_account_id: str = '', category_filter: str = ''
         <span class="bulk-spacer"></span>
         <button type="button" class="mini-btn primary" onclick="openBulkActionModal()">批量操作</button>
       </div>
-      <div class="table-note"><span class="muted">列表已精简：常用操作外露，Client ID / Token / 错误收进“详情”。</span><span class="muted">共 {len(accounts)} 个邮箱</span></div>
+      <div class="table-note"><span class="muted">列表已分页：常用操作外露，Client ID / Token / 错误收进“详情”。</span><span class="muted">当前页 {len(accounts)} 个 / 共 {page_meta['total']} 个邮箱</span></div>
+      {pagination_html}
       <table><tr><th><input type="checkbox" onclick="setAllAccountChecks(this.checked)"></th><th>ID</th><th>邮箱</th><th>状态</th><th>操作</th><th>详情</th></tr>{account_rows}</table>
+      {pagination_html}
   </div>
 </section>
 
 <div id="bulk-action-modal" class="modal-backdrop" onclick="closeModalOnBackdrop(event)">
   <div class="modal">
     <div class="modal-head"><h3>已勾选邮箱批量操作</h3><button type="button" class="modal-close" onclick="closeModal('bulk-action-modal')">关闭</button></div>
-    <p class="muted">下面所有操作只会作用于邮箱列表中已勾选的邮箱，不会影响未勾选账号。</p>
+    <p class="muted">下面所有操作只会作用于邮箱列表中已勾选的邮箱，不会影响未勾选账号。单个账号可通过列表行里的 <code>action="/inspect_account"</code> 综合检测，结果会显示 Graph 可读、OAuth IMAP 可读、密码 IMAP 可读 等状态。</p>
     <div class="selected-preview">当前已选 <b id="bulk-modal-selected-count">0</b> 个邮箱</div>
 
     <div class="bulk-action-panel">
@@ -2495,7 +2569,15 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == '/mailboxes':
             qs = urllib.parse.parse_qs(parsed.query)
             category_filter = qs.get('category', [''])[0]
-            self.send_html(render_mailboxes_page(get_active_account_id(self.headers.get('Cookie', '')), category_filter))
+            try:
+                page_num = int(qs.get('page', ['1'])[0] or 1)
+            except Exception:
+                page_num = 1
+            try:
+                per_page = int(qs.get('per_page', ['50'])[0] or 50)
+            except Exception:
+                per_page = 50
+            self.send_html(render_mailboxes_page(get_active_account_id(self.headers.get('Cookie', '')), category_filter, page_num, per_page))
             return
         if parsed.path == '/tokens':
             self.send_html(render_tokens_page())
