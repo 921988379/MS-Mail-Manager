@@ -1268,6 +1268,17 @@ def delete_saved_account(account_id: str):
         conn.commit()
 
 
+def delete_saved_accounts(account_ids):
+    ids = [str(x).strip() for x in (account_ids or []) if str(x).strip().isdigit()]
+    if not ids:
+        return 0
+    placeholders = ','.join('?' for _ in ids)
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute(f'DELETE FROM saved_accounts WHERE id IN ({placeholders})', ids)
+        conn.commit()
+        return int(cur.rowcount or 0)
+
+
 def exchange_refresh_token(client_id: str, refresh_token: str, scope: str = '', tenant: str = 'consumers'):
     fields = {
         'client_id': client_id,
@@ -2027,12 +2038,15 @@ document.addEventListener('submit', e => {
   if (!form || !form.matches('form')) return;
   if (form.getAttribute('onsubmit')) return;
   const action = form.getAttribute('action') || '';
+  const confirmText = form.getAttribute('data-confirm') || '';
+  if (confirmText && !confirm(confirmText)) return;
   const titles = {
     '/check': '检测令牌状态',
     '/refresh': '刷新令牌',
     '/check_all': '批量检测令牌状态',
     '/refresh_all': '批量刷新令牌',
     '/bulk_category': '批量设置分类',
+    '/bulk_delete': '批量删除邮箱',
     '/token_selected': '获取已选邮箱令牌',
     '/refresh_selected': '刷新已选邮箱令牌',
     '/check_selected': '检查已选邮箱状态',
@@ -2211,6 +2225,15 @@ def render_mailboxes_page(active_account_id: str = '', category_filter: str = ''
         <form method="post" action="/inspect_selected" class="bulk-selected-form"><div class="bulk-selected-ids"></div><button type="submit" style="background:#ea580c">综合检测</button></form>
       </div>
       <p class="muted">令牌获取/刷新/状态检查会使用 Microsoft Graph Mail.Read 权限调用 Microsoft 接口，账号较多时请稍等。</p>
+    </div>
+
+    <div class="bulk-action-panel">
+      <h4>危险操作</h4>
+      <form method="post" action="/bulk_delete" class="bulk-selected-form" data-confirm="确定删除已勾选邮箱？此操作不可恢复，建议先确认已经备份。">
+        <div class="bulk-selected-ids"></div>
+        <button type="submit" style="background:#dc2626">批量删除</button>
+      </form>
+      <p class="muted">只删除当前已勾选的邮箱记录；删除后不会再出现在邮箱管理、项目取码和 API 查询中。</p>
     </div>
   </div>
 </div>
@@ -3150,6 +3173,12 @@ class Handler(BaseHTTPRequestHandler):
             updated = update_accounts_category(ids, category)
             label = normalize_category_name(category) or '未分类'
             self.send_html(page('批量设置分类', '<div class="card"><h2>批量设置分类</h2><p class="ok">已更新 ' + html.escape(str(updated)) + ' 个邮箱。</p><p>目标分类：<b>' + html.escape(label) + '</b></p></div>'))
+            return
+        if post_path == '/bulk_delete':
+            raw = self.read_form_raw()
+            ids = raw.get('ids', [])
+            deleted = delete_saved_accounts(ids)
+            self.send_html(page('批量删除邮箱', '<div class="card"><h2>批量删除邮箱</h2><p class="ok">已删除 ' + html.escape(str(deleted)) + ' 个邮箱。</p><p class="muted">如误删，可从操作前数据库备份恢复。</p><p><a href="/mailboxes">返回邮箱管理</a></p></div>'))
             return
         if post_path == '/category_create':
             form = self.read_form()
