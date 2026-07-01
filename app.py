@@ -40,8 +40,10 @@ BIND_HOST = os.environ.get('RTWEB_HOST', '127.0.0.1')
 BIND_PORT = int(os.environ.get('RTWEB_PORT', '8020'))
 TOKEN_URL_TEMPLATE = 'https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token'
 ME_URL = 'https://graph.microsoft.com/v1.0/me'
+OUTLOOK_REST_BASE_URL = 'https://outlook.office.com/api/v2.0/me'
 MAIL_FOLDERS = [('INBOX', '收件箱'), ('Junk', '垃圾邮箱')]
 GRAPH_MAIL_FOLDERS = [('inbox', '收件箱'), ('junkemail', '垃圾邮箱')]
+OUTLOOK_REST_MAIL_FOLDERS = [('inbox', '收件箱'), ('junkemail', '垃圾邮箱')]
 API_RATE_LIMIT_PER_MINUTE = int(os.environ.get('RTWEB_API_RATE_LIMIT_PER_MINUTE', '60'))
 API_RATE_LIMIT_PER_DAY = int(os.environ.get('RTWEB_API_RATE_LIMIT_PER_DAY', '2000'))
 API_ALLOW_QUERY_KEY = os.environ.get('RTWEB_API_ALLOW_QUERY_KEY', '1') != '0'
@@ -457,7 +459,7 @@ def update_saved_status(email_addr: str, status: str, error: str = ''):
         conn.commit()
 
 
-OK_ACCOUNT_STATUSES = {'ok', 'token_ok', 'graph_ok', 'xoauth2_imap_ok', 'imap_password_ok'}
+OK_ACCOUNT_STATUSES = {'ok', 'token_ok', 'graph_ok', 'outlook_rest_ok', 'xoauth2_imap_ok', 'imap_password_ok'}
 ERROR_ACCOUNT_STATUSES = {'error', 'token_failed', 'graph_failed', 'xoauth2_imap_failed', 'imap_password_failed', 'all_failed'}
 
 
@@ -478,6 +480,8 @@ def status_label(value: str) -> str:
         'token_failed': '令牌失效',
         'graph_ok': 'Graph 可读',
         'graph_failed': 'Graph 失败',
+        'outlook_rest_ok': 'Outlook REST 可读',
+        'outlook_rest_failed': 'Outlook REST 失败',
         'xoauth2_imap_ok': 'OAuth IMAP 可读',
         'xoauth2_imap_failed': 'OAuth IMAP 失败',
         'imap_password_ok': '密码 IMAP 可读',
@@ -950,7 +954,7 @@ def dashboard_summary():
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         total_accounts = conn.execute('SELECT COUNT(*) AS n FROM saved_accounts').fetchone()['n']
-        ok_accounts = conn.execute("SELECT COUNT(*) AS n FROM saved_accounts WHERE last_status IN ('ok','token_ok','graph_ok','xoauth2_imap_ok','imap_password_ok')").fetchone()['n']
+        ok_accounts = conn.execute("SELECT COUNT(*) AS n FROM saved_accounts WHERE last_status IN ('ok','token_ok','graph_ok','outlook_rest_ok','xoauth2_imap_ok','imap_password_ok')").fetchone()['n']
         error_accounts = conn.execute("SELECT COUNT(*) AS n FROM saved_accounts WHERE last_status IN ('error','token_failed','graph_failed','xoauth2_imap_failed','imap_password_failed','all_failed') OR last_status LIKE '%_failed'").fetchone()['n']
         categories = conn.execute("SELECT COUNT(*) AS n FROM categories").fetchone()['n']
         api_keys = conn.execute("SELECT COUNT(*) AS n FROM api_keys WHERE enabled=1").fetchone()['n']
@@ -1352,6 +1356,25 @@ def graph_message_to_mail(msg: dict):
     }
 
 
+def outlook_rest_message_to_mail(msg: dict):
+    sender = (((msg.get('From') or msg.get('from') or {}).get('EmailAddress') or (msg.get('from') or {}).get('emailAddress')) or {})
+    name = sender.get('Name') or sender.get('name') or ''
+    addr = sender.get('Address') or sender.get('address') or ''
+    source = (name + (' <' + addr + '>' if addr else '')).strip() or addr
+    body = msg.get('BodyPreview') or msg.get('bodyPreview') or ''
+    if not body:
+        body_obj = msg.get('Body') or msg.get('body') or {}
+        body = body_obj.get('Content') or body_obj.get('content') or ''
+        if (body_obj.get('ContentType') or body_obj.get('contentType') or '').lower() == 'html':
+            body = html_to_text_preview(body)
+    return {
+        'from': source,
+        'subject': msg.get('Subject') or msg.get('subject') or '',
+        'date': msg.get('ReceivedDateTime') or msg.get('receivedDateTime') or msg.get('SentDateTime') or msg.get('sentDateTime') or '',
+        'preview': body or '',
+    }
+
+
 def imap4_ssl_ipv4(host: str, port: int = 993, timeout: int = None):
     # Some hosts resolve Microsoft IMAP to IPv6 addresses even when the server has
     # no usable IPv6 route, which surfaces as [Errno 101] Network is unreachable.
@@ -1384,6 +1407,24 @@ def fetch_graph_latest_emails(access_token: str, limit: int = 10):
             mail['folder'] = folder_label
             results.append(mail)
     return results[:limit * len(GRAPH_MAIL_FOLDERS)]
+
+
+def fetch_outlook_rest_latest_emails(access_token: str, limit: int = 10):
+    results = []
+    for folder_id, folder_label in OUTLOOK_REST_MAIL_FOLDERS:
+        url = f'{OUTLOOK_REST_BASE_URL}/mailfolders/{folder_id}/messages?' + urllib.parse.urlencode({
+            '$top': str(limit),
+            '$orderby': 'ReceivedDateTime desc',
+            '$select': 'ReceivedDateTime,SentDateTime,Subject,BodyPreview,From'
+        })
+        req = urllib.request.Request(url, headers={'Authorization': f'Bearer {access_token}', 'Accept': 'application/json'})
+        with urllib.request.urlopen(req, timeout=GRAPH_READ_TIMEOUT_SECONDS) as resp:
+            payload = json.loads(resp.read().decode('utf-8'))
+        for m in payload.get('value', []):
+            mail = outlook_rest_message_to_mail(m)
+            mail['folder'] = folder_label
+            results.append(mail)
+    return results[:limit * len(OUTLOOK_REST_MAIL_FOLDERS)]
 
 
 def build_xoauth2_payload(username: str, access_token: str) -> str:
@@ -1497,15 +1538,26 @@ def fetch_latest_codes_for_account(account, limit: int = 10):
 
     if gok:
         try:
+            mails = fetch_outlook_rest_latest_emails(gpayload.get('access_token'), limit=limit)
+            codes = [extract_verification_summary(account['email'], m) for m in mails]
+            codes = [dict(c, source_api='outlook_rest') for c in codes if c]
+            if codes or mails:
+                update_saved_status(account['email'], 'outlook_rest_ok')
+                return {'email': account['email'], 'status': 'ok', 'error': '', 'source_api': 'outlook_rest', 'graph_error': graph_error, 'channel_status': {'graph': 'failed' if graph_error else 'empty', 'token': 'ok', 'outlook_rest': 'ok'}, 'mail_count': len(mails), 'latest_mails': summarize_latest_mails(mails), 'codes': codes}
+        except Exception as e:
+            graph_error = (graph_error + ' | Outlook REST: ' + str(e)).strip(' |')
+
+    if gok:
+        try:
             mails = fetch_latest_emails(account['email'], gpayload.get('access_token'), limit=limit)
             codes = [extract_verification_summary(account['email'], m) for m in mails]
             codes = [dict(c, source_api='imap') for c in codes if c]
             update_saved_status(account['email'], 'xoauth2_imap_ok')
-            return {'email': account['email'], 'status': 'ok', 'error': '', 'source_api': 'imap', 'graph_error': graph_error, 'channel_status': {'graph': 'failed' if graph_error else 'empty', 'token': 'ok', 'xoauth2_imap': 'ok'}, 'mail_count': len(mails), 'latest_mails': summarize_latest_mails(mails), 'codes': codes}
+            return {'email': account['email'], 'status': 'ok', 'error': '', 'source_api': 'imap', 'graph_error': graph_error, 'channel_status': {'graph': 'failed' if graph_error else 'empty', 'token': 'ok', 'outlook_rest': 'failed' if graph_error else 'empty', 'xoauth2_imap': 'ok'}, 'mail_count': len(mails), 'latest_mails': summarize_latest_mails(mails), 'codes': codes}
         except Exception as e:
             err = str(e)
             if is_imap_not_connected_error(err):
-                err = 'IMAP 已认证但邮箱未连接：通常是该账号未开通/未初始化 Outlook 邮箱，或 Microsoft 账户没有可连接的 Exchange mailbox。Graph 兜底错误：' + graph_error
+                err = 'IMAP 已认证但邮箱未连接：通常是该账号未开通/未初始化 Outlook 邮箱，或 Microsoft 账户没有可连接的 Exchange mailbox。Graph/Outlook REST 兜底错误：' + graph_error
             graph_error = (graph_error + ' | XOAUTH2 IMAP: ' + err).strip(' |')
     else:
         graph_error = (graph_error + ' | token: ' + graph_error).strip(' |')
@@ -1594,7 +1646,7 @@ def fetch_password_latest_emails(username: str, password: str, limit: int = 10):
 
 
 def inspect_saved_account(account, limit: int = 10):
-    result = {'email': account.get('email', ''), 'password_login': {'configured': bool(account.get('password')), 'ok': False, 'error': '', 'mail_count': 0, 'codes': []}, 'token': {'configured': bool(account.get('client_id') and account.get('refresh_token')), 'ok': False, 'status': '未配置', 'expires_in': '', 'scope': '', 'rotated': False, 'error': ''}, 'graph_mail': {'ok': False, 'error': '', 'mail_count': 0, 'codes': []}, 'best_codes': [], 'best_source': ''}
+    result = {'email': account.get('email', ''), 'password_login': {'configured': bool(account.get('password')), 'ok': False, 'error': '', 'mail_count': 0, 'codes': []}, 'token': {'configured': bool(account.get('client_id') and account.get('refresh_token')), 'ok': False, 'status': '未配置', 'expires_in': '', 'scope': '', 'rotated': False, 'error': ''}, 'graph_mail': {'ok': False, 'error': '', 'mail_count': 0, 'codes': []}, 'outlook_rest_mail': {'ok': False, 'error': '', 'mail_count': 0, 'codes': []}, 'best_codes': [], 'best_source': ''}
     if result['token']['configured']:
         token_status = check_saved_account_token(account)
         result['token'].update({'ok': bool(token_status.get('ok')), 'status': token_status.get('status') or '', 'expires_in': token_status.get('expires_in') or '', 'scope': token_status.get('scope') or '', 'rotated': bool(token_status.get('rotated')), 'error': token_status.get('error') or ''})
@@ -1610,8 +1662,20 @@ def inspect_saved_account(account, limit: int = 10):
                     result['best_source'] = 'graph'
             except Exception as e:
                 result['graph_mail']['error'] = str(e)[:500]
+            try:
+                mails = fetch_outlook_rest_latest_emails(payload.get('access_token'), limit=limit)
+                codes = [extract_verification_summary(account['email'], m) for m in mails]
+                codes = [dict(c, source_api='outlook_rest') for c in codes if c]
+                result['outlook_rest_mail'].update({'ok': True, 'mail_count': len(mails), 'codes': codes})
+                if codes and not result['best_codes']:
+                    result['best_codes'] = codes
+                    result['best_source'] = 'outlook_rest'
+            except Exception as e:
+                result['outlook_rest_mail']['error'] = str(e)[:500]
         else:
-            result['graph_mail']['error'] = (payload.get('error_description') or payload.get('error') or '无法换取 Access Token')[:500]
+            err = (payload.get('error_description') or payload.get('error') or '无法换取 Access Token')[:500]
+            result['graph_mail']['error'] = err
+            result['outlook_rest_mail']['error'] = err
     if account.get('password'):
         try:
             mails = fetch_password_latest_emails(account['email'], account['password'], limit=limit)
@@ -1623,17 +1687,18 @@ def inspect_saved_account(account, limit: int = 10):
                 result['best_source'] = 'imap_password'
         except Exception as e:
             result['password_login']['error'] = str(e)[:500]
-    if result['token']['ok'] or result['graph_mail']['ok'] or result['password_login']['ok']:
-        update_saved_status(account['email'], 'graph_ok' if result['graph_mail']['ok'] else ('imap_password_ok' if result['password_login']['ok'] else 'token_ok'))
+    if result['token']['ok'] or result['graph_mail']['ok'] or result['outlook_rest_mail']['ok'] or result['password_login']['ok']:
+        update_saved_status(account['email'], 'graph_ok' if result['graph_mail']['ok'] else ('outlook_rest_ok' if result['outlook_rest_mail']['ok'] else ('imap_password_ok' if result['password_login']['ok'] else 'token_ok')))
     else:
-        err = result['token']['error'] or result['graph_mail']['error'] or result['password_login']['error'] or '综合检测失败'
+        err = result['token']['error'] or result['graph_mail']['error'] or result['outlook_rest_mail']['error'] or result['password_login']['error'] or '综合检测失败'
         update_saved_status(account['email'], 'all_failed', err[:1000])
     return result
 
 
 def render_batch_inspect_result(results):
-    ok_count = sum(1 for r in results if r['token']['ok'] or r['graph_mail']['ok'] or r['password_login']['ok'])
+    ok_count = sum(1 for r in results if r['token']['ok'] or r['graph_mail']['ok'] or r.get('outlook_rest_mail', {}).get('ok') or r['password_login']['ok'])
     graph_ok = sum(1 for r in results if r['graph_mail']['ok'])
+    outlook_ok = sum(1 for r in results if r.get('outlook_rest_mail', {}).get('ok'))
     token_ok = sum(1 for r in results if r['token']['ok'])
     pwd_ok = sum(1 for r in results if r['password_login']['ok'])
     code_count = sum(len(r.get('best_codes') or []) for r in results)
@@ -1641,16 +1706,17 @@ def render_batch_inspect_result(results):
         '<tr><td>' + html.escape(r.get('email','')) + '</td>'
         '<td>' + ('<span class="ok">可用</span>' if r['token']['ok'] else '<span class="bad">失败</span>' if r['token']['configured'] else '<span class="muted">未配置</span>') + '</td>'
         '<td>' + ('<span class="ok">可读</span>' if r['graph_mail']['ok'] else '<span class="bad">失败</span>' if r['token']['configured'] else '<span class="muted">未配置</span>') + '</td>'
+        '<td>' + ('<span class="ok">可读</span>' if r.get('outlook_rest_mail', {}).get('ok') else '<span class="bad">失败</span>' if r['token']['configured'] else '<span class="muted">未配置</span>') + '</td>'
         '<td>' + ('<span class="ok">可读</span>' if r['password_login']['ok'] else '<span class="bad">失败</span>' if r['password_login']['configured'] else '<span class="muted">未配置</span>') + '</td>'
         '<td>' + html.escape(r.get('best_source') or '') + '</td>'
         '<td>' + html.escape(str(len(r.get('best_codes') or []))) + '</td>'
-        '<td>' + html.escape((r['token'].get('error') or r['graph_mail'].get('error') or r['password_login'].get('error') or '')[:160]) + '</td></tr>'
+        '<td>' + html.escape((r['token'].get('error') or r['graph_mail'].get('error') or r.get('outlook_rest_mail', {}).get('error') or r['password_login'].get('error') or '')[:160]) + '</td></tr>'
         for r in results
-    ) or '<tr><td colspan="7" class="muted">没有选择账号。</td></tr>'
+    ) or '<tr><td colspan="8" class="muted">没有选择账号。</td></tr>'
     body = '<div class="card"><h2>批量综合检测结果</h2>'
-    body += '<div class="stat-grid"><div class="stat"><b>' + str(len(results)) + '</b><span>检测账号</span></div><div class="stat"><b>' + str(ok_count) + '</b><span>至少一个通道可用</span></div><div class="stat"><b>' + str(token_ok) + '</b><span>令牌可用</span></div><div class="stat"><b>' + str(graph_ok) + '</b><span>Graph 可读</span></div><div class="stat"><b>' + str(pwd_ok) + '</b><span>密码 IMAP 可读</span></div><div class="stat"><b>' + str(code_count) + '</b><span>验证码摘要</span></div></div>'
-    body += '<p class="muted">综合检测会按 Refresh Token / Graph / OAuth IMAP / 账号密码 IMAP 聚合判断；结果不会显示密码、Access Token 或 Refresh Token 明文。</p>'
-    body += '<table><tr><th>邮箱</th><th>令牌</th><th>Graph</th><th>密码 IMAP</th><th>最佳来源</th><th>验证码数</th><th>错误摘要</th></tr>' + rows + '</table></div>'
+    body += '<div class="stat-grid"><div class="stat"><b>' + str(len(results)) + '</b><span>检测账号</span></div><div class="stat"><b>' + str(ok_count) + '</b><span>至少一个通道可用</span></div><div class="stat"><b>' + str(token_ok) + '</b><span>令牌可用</span></div><div class="stat"><b>' + str(graph_ok) + '</b><span>Graph 可读</span></div><div class="stat"><b>' + str(outlook_ok) + '</b><span>Outlook REST 可读</span></div><div class="stat"><b>' + str(pwd_ok) + '</b><span>密码 IMAP 可读</span></div><div class="stat"><b>' + str(code_count) + '</b><span>验证码摘要</span></div></div>'
+    body += '<p class="muted">综合检测会按 Refresh Token / Graph / Outlook REST / OAuth IMAP / 账号密码 IMAP 聚合判断；结果不会显示密码、Access Token 或 Refresh Token 明文。</p>'
+    body += '<table><tr><th>邮箱</th><th>令牌</th><th>Graph</th><th>Outlook REST</th><th>密码 IMAP</th><th>最佳来源</th><th>验证码数</th><th>错误摘要</th></tr>' + rows + '</table></div>'
     return page('批量综合检测结果', body)
 
 
@@ -1660,13 +1726,14 @@ def render_account_inspect_result(result: dict):
             return '<span class="muted">未配置</span>'
         return '<span class="ok">成功</span>' if ok else '<span class="bad">失败</span>'
     code_rows = ''.join('<tr><td>' + html.escape(c.get('source_api','')) + '</td><td>' + html.escape(c.get('folder','')) + '</td><td><b>' + html.escape(c.get('code','')) + '</b></td><td>' + html.escape(c.get('source','')) + '</td><td>' + html.escape(c.get('subject','')) + '</td><td>' + html.escape(c.get('date','')) + '</td></tr>' for c in (result.get('best_codes') or [])[:10]) or '<tr><td colspan="6" class="muted">暂无验证码摘要。</td></tr>'
-    token = result['token']; graph = result['graph_mail']; pwd = result['password_login']
+    token = result['token']; graph = result['graph_mail']; outlook = result.get('outlook_rest_mail', {'ok': False, 'error': '', 'mail_count': 0}); pwd = result['password_login']
     html_body = '<div class="card"><h2>账号综合检测：' + html.escape(result.get('email','')) + '</h2>'
     html_body += '<table><tr><th>项目</th><th>状态</th><th>信息</th></tr>'
     html_body += '<tr><td>Refresh Token / Access Token</td><td>' + badge(token.get('ok'), token.get('configured')) + '</td><td>状态：' + html.escape(str(token.get('status') or '')) + ' · 有效期：' + html.escape(str(token.get('expires_in') or '')) + ' · 轮换：' + ('是' if token.get('rotated') else '否') + '<br><span class="bad">' + html.escape(token.get('error') or '') + '</span></td></tr>'
     html_body += '<tr><td>Graph 邮件读取</td><td>' + badge(graph.get('ok'), token.get('configured')) + '</td><td>邮件数：' + html.escape(str(graph.get('mail_count') or 0)) + '<br><span class="bad">' + html.escape(graph.get('error') or '') + '</span></td></tr>'
+    html_body += '<tr><td>Outlook REST 邮件读取</td><td>' + badge(outlook.get('ok'), token.get('configured')) + '</td><td>邮件数：' + html.escape(str(outlook.get('mail_count') or 0)) + '<br><span class="bad">' + html.escape(outlook.get('error') or '') + '</span></td></tr>'
     html_body += '<tr><td>账号密码 IMAP</td><td>' + badge(pwd.get('ok'), pwd.get('configured')) + '</td><td>邮件数：' + html.escape(str(pwd.get('mail_count') or 0)) + '<br><span class="bad">' + html.escape(pwd.get('error') or '') + '</span></td></tr>'
-    html_body += '</table><h3>最新验证码 / 邮件摘要</h3><p class="muted">优先展示 Graph 结果；令牌失效或 Graph 不可用时展示账号密码 IMAP 结果。不会显示密码、Access Token 或 Refresh Token 明文。</p><table><tr><th>来源</th><th>文件夹</th><th>验证码</th><th>发件人</th><th>主题</th><th>时间</th></tr>' + code_rows + '</table></div>'
+    html_body += '</table><h3>最新验证码 / 邮件摘要</h3><p class="muted">优先展示 Graph 结果；Graph 不可用时尝试 Outlook REST，再兜底账号密码 IMAP。不会显示密码、Access Token 或 Refresh Token 明文。</p><table><tr><th>来源</th><th>文件夹</th><th>验证码</th><th>发件人</th><th>主题</th><th>时间</th></tr>' + code_rows + '</table></div>'
     return page('账号综合检测', html_body)
 
 
@@ -2066,7 +2133,7 @@ document.addEventListener('keydown', e => {
         'version': '查看版本、仓库和安全更新状态。',
         'tokens': '刷新 Refresh Token / Access Token，临时使用默认不保存。',
         'mailboxes': '导入、分类、检测和管理 Outlook / Hotmail 邮箱。',
-        'mails': '选择邮箱后自动读取验证码和最新邮件摘要。',
+        'mails': '选择邮箱后手动读取验证码和最新邮件摘要。',
         'api_key': '创建和管理外部查询 API 的访问密钥。',
         'api': '查看外部接口、调用方式和安全说明。',
         'projects': '维护项目分类和邮件筛选规则。',
@@ -2427,8 +2494,8 @@ def render_mails_page(active_account_id: str = ''):
     )
     content = '<section class="section-grid">'
     content += '<div class="card scroll"><div class="mail-search"><h3>选择邮箱</h3><p class="muted">先选择一个邮箱，再读取验证码和最新邮件摘要。</p><input id="mailbox-filter" oninput="filterMailboxes()" placeholder="搜索邮箱 / ID / 分类"><p class="muted">显示 <b id="mailbox-visible-count">' + str(len(accounts)) + '</b> / ' + str(len(accounts)) + ' 个邮箱</p></div><div class="mail-picker-list">' + account_options + '</div></div>'
-    content += '<div class="card"><div class="mail-result-top"><div><h3>验证码邮件</h3><p class="muted">当前邮箱：<b id="active-email">' + html.escape(active_email or '未选择') + '</b> · 自动刷新：<span id="poll-status">等待中</span></p></div><button type="button" class="mini-btn primary" onclick="pollCodes()">立即刷新</button></div><div id="codes" class="mail-result-area"><div class="empty-state">加载中...</div></div></div></section>'
-    content += '\n<script>\nconst SOURCE_LABELS = {graph: \'Graph 成功\', imap: \'OAuth IMAP 成功\', imap_password: \'密码 IMAP 成功\'};\nasync function pollCodes() {\n  const box = document.getElementById(\'codes\');\n  const status = document.getElementById(\'poll-status\');\n  try {\n    status.textContent = \'获取中 \' + new Date().toLocaleTimeString();\n    const res = await fetch(\'/api/codes\', {cache: \'no-store\'});\n    const data = await res.json();\n    let out = \'\';\n    if (!(data.results || []).length) out = \'<div class="empty-state">请先在左侧选择一个邮箱。</div>\';\n    for (const item of data.results || []) {\n      const sourceLabel = SOURCE_LABELS[item.source_api] || item.source_api || \'未知通道\';\n      if (item.status !== \'ok\') {\n        out += `<div class="mail-summary-card bad"><h3>读取失败</h3><p><b>${escapeHtml(item.email || \'\')}</b></p><p>${escapeHtml(item.error || \'读取失败\')}</p><p class="muted">建议到“邮箱管理”里点“综合检测”，或换一个账号测试。</p></div>`;\n        continue;\n      }\n      const codeCount = (item.codes || []).length;\n      const mailCount = Number(item.mail_count || 0);\n      out += `<div class="mail-summary-card ok"><h3>${escapeHtml(sourceLabel)}</h3><p><b>${escapeHtml(item.email || \'\')}</b></p><div class="metric-row"><span class="metric-chip">读取邮件 ${mailCount} 封</span><span class="metric-chip">验证码 ${codeCount} 条</span><span class="metric-chip">自动刷新 30 秒</span></div></div>`;\n      if (codeCount) {\n        out += \'<h4>验证码</h4><div class="code-grid">\';\n        for (const c of item.codes || []) out += `<div class="code-card"><div class="code-card-head"><span class="code-pill">${escapeHtml(c.code || \'\')}</span><button type="button" class="mini-btn primary" onclick="copyText(this.dataset.copy)" data-copy="${escapeAttr(c.code || \'\')}">复制验证码</button></div><p class="muted">邮箱位置：${escapeHtml(c.folder || \'\')} · 来源：${escapeHtml(c.source || \'\')} · 时间：${escapeHtml(c.date || \'\')}</p><div class="mail-subject">${escapeHtml(c.subject || \'\')}</div></div>`;\n        out += \'</div>\';\n      } else {\n        out += \'<div class="empty-state">通道读取成功，但最近邮件里没有识别到验证码。下面显示最新邮件摘要。</div>\';\n      }\n      if ((item.latest_mails || []).length) {\n        out += \'<h4>最新邮件摘要</h4><div class="mail-card-grid">\';\n        for (const m of item.latest_mails || []) out += `<div class="mail-card"><div class="mail-subject">${escapeHtml(m.subject || \'(无主题)\')}</div><p class="muted">邮箱位置：${escapeHtml(m.folder || \'\')} · 发件人：${escapeHtml(m.source || \'\')} · 时间：${escapeHtml(m.date || \'\')}</p><div class="mail-preview">${escapeHtml(m.preview || \'\').slice(0,260)}</div></div>`;\n        out += \'</div>\';\n      }\n    }\n    box.innerHTML = out; status.textContent = \'已更新 \' + new Date().toLocaleTimeString();\n  } catch (e) { status.textContent = \'失败 \' + e; box.innerHTML = \'<div class="mail-summary-card bad"><h3>请求失败</h3><p>\' + escapeHtml(String(e)) + \'</p></div>\'; }\n}\nfunction filterMailboxes() {\n  const q = (document.getElementById(\'mailbox-filter\').value || \'\').toLowerCase().trim();\n  let visible = 0;\n  document.querySelectorAll(\'[data-mailbox-row]\').forEach(row => {\n    const hit = !q || (row.dataset.search || \'\').includes(q);\n    row.style.display = hit ? \'\' : \'none\';\n    if (hit) visible++;\n  });\n  const el = document.getElementById(\'mailbox-visible-count\');\n  if (el) el.textContent = visible;\n}\nfunction escapeHtml(s) { return String(s || \'\').replace(/[&<>"]/g, c => ({\'&\':\'&amp;\',\'<\':\'&lt;\',\'>\':\'&gt;\',\'"\':\'&quot;\'}[c])); }\nfunction escapeAttr(s) { return String(s || \'\').replace(/[\\\\\'"<>]/g, \'\'); }\nfunction copyText(s) { navigator.clipboard && navigator.clipboard.writeText(s || \'\'); }\npollCodes(); setInterval(pollCodes, 30000);\n</script>'
+    content += '<div class="card"><div class="mail-result-top"><div><h3>验证码邮件</h3><p class="muted">当前邮箱：<b id="active-email">' + html.escape(active_email or '未选择') + '</b> · 状态：<span id="poll-status">等待手动获取</span></p></div><button type="button" class="mini-btn primary" onclick="pollCodes()">手动获取邮件</button></div><div id="codes" class="mail-result-area"><div class="empty-state">不会自动刷新；请选择邮箱后点击“手动获取邮件”。</div></div></div></section>'
+    content += '\n<script>\nconst SOURCE_LABELS = {graph: \'Graph 成功\', outlook_rest: \'Outlook REST 成功\', imap: \'OAuth IMAP 成功\', imap_password: \'密码 IMAP 成功\'};\nasync function pollCodes() {\n  const box = document.getElementById(\'codes\');\n  const status = document.getElementById(\'poll-status\');\n  try {\n    status.textContent = \'获取中 \' + new Date().toLocaleTimeString();\n    const res = await fetch(\'/api/codes\', {cache: \'no-store\'});\n    const data = await res.json();\n    let out = \'\';\n    if (!(data.results || []).length) out = \'<div class="empty-state">请先在左侧选择一个邮箱。</div>\';\n    for (const item of data.results || []) {\n      const sourceLabel = SOURCE_LABELS[item.source_api] || item.source_api || \'未知通道\';\n      if (item.status !== \'ok\') {\n        out += `<div class="mail-summary-card bad"><h3>读取失败</h3><p><b>${escapeHtml(item.email || \'\')}</b></p><p>${escapeHtml(item.error || \'读取失败\')}</p><p class="muted">建议到“邮箱管理”里点“综合检测”，或换一个账号测试。</p></div>`;\n        continue;\n      }\n      const codeCount = (item.codes || []).length;\n      const mailCount = Number(item.mail_count || 0);\n      out += `<div class="mail-summary-card ok"><h3>${escapeHtml(sourceLabel)}</h3><p><b>${escapeHtml(item.email || \'\')}</b></p><div class="metric-row"><span class="metric-chip">读取邮件 ${mailCount} 封</span><span class="metric-chip">验证码 ${codeCount} 条</span><span class="metric-chip">手动获取</span></div></div>`;\n      if (codeCount) {\n        out += \'<h4>验证码</h4><div class="code-grid">\';\n        for (const c of item.codes || []) out += `<div class="code-card"><div class="code-card-head"><span class="code-pill">${escapeHtml(c.code || \'\')}</span><button type="button" class="mini-btn primary" onclick="copyText(this.dataset.copy)" data-copy="${escapeAttr(c.code || \'\')}">复制验证码</button></div><p class="muted">邮箱位置：${escapeHtml(c.folder || \'\')} · 来源：${escapeHtml(c.source || \'\')} · 时间：${escapeHtml(c.date || \'\')}</p><div class="mail-subject">${escapeHtml(c.subject || \'\')}</div></div>`;\n        out += \'</div>\';\n      } else {\n        out += \'<div class="empty-state">通道读取成功，但最近邮件里没有识别到验证码。下面显示最新邮件摘要。</div>\';\n      }\n      if ((item.latest_mails || []).length) {\n        out += \'<h4>最新邮件摘要</h4><div class="mail-card-grid">\';\n        for (const m of item.latest_mails || []) out += `<div class="mail-card"><div class="mail-subject">${escapeHtml(m.subject || \'(无主题)\')}</div><p class="muted">邮箱位置：${escapeHtml(m.folder || \'\')} · 发件人：${escapeHtml(m.source || \'\')} · 时间：${escapeHtml(m.date || \'\')}</p><div class="mail-preview">${escapeHtml(m.preview || \'\').slice(0,260)}</div></div>`;\n        out += \'</div>\';\n      }\n    }\n    box.innerHTML = out; status.textContent = \'已更新 \' + new Date().toLocaleTimeString();\n  } catch (e) { status.textContent = \'失败 \' + e; box.innerHTML = \'<div class="mail-summary-card bad"><h3>请求失败</h3><p>\' + escapeHtml(String(e)) + \'</p></div>\'; }\n}\nfunction filterMailboxes() {\n  const q = (document.getElementById(\'mailbox-filter\').value || \'\').toLowerCase().trim();\n  let visible = 0;\n  document.querySelectorAll(\'[data-mailbox-row]\').forEach(row => {\n    const hit = !q || (row.dataset.search || \'\').includes(q);\n    row.style.display = hit ? \'\' : \'none\';\n    if (hit) visible++;\n  });\n  const el = document.getElementById(\'mailbox-visible-count\');\n  if (el) el.textContent = visible;\n}\nfunction escapeHtml(s) { return String(s || \'\').replace(/[&<>"]/g, c => ({\'&\':\'&amp;\',\'<\':\'&lt;\',\'>\':\'&gt;\',\'"\':\'&quot;\'}[c])); }\nfunction escapeAttr(s) { return String(s || \'\').replace(/[\\\\\'"<>]/g, \'\'); }\nfunction copyText(s) { navigator.clipboard && navigator.clipboard.writeText(s || \'\'); }\ndocument.getElementById(\'poll-status\').textContent = \'等待手动获取\';\n</script>'
     return app_page('邮件获取', 'mails', content)
 
 

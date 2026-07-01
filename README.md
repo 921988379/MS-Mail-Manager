@@ -4,7 +4,7 @@
 
 - 官网/线上入口：`https://token.seoyh.net/`
 - 仓库：`https://github.com/921988379/MS-Mail-Manager`
-- 当前版本：`1.0.6`
+- 当前版本：`1.0.7`
 - 版权支持：由 [一点优化](https://www.seoyh.net/) 提供
 
 > 安全提醒：本项目会处理邮箱密码、Refresh Token、Access Token、验证码邮件等敏感数据。请只部署在自己可信服务器上，并妥善保存 `RTWEB_DATA_KEY`、数据库和环境变量文件。
@@ -13,13 +13,42 @@
 
 - 邮箱账号托管：单个/批量导入、分类管理、批量导出、删除账号
 - Refresh Token 管理：检测状态、获取 Access Token、保存轮换后的 Refresh Token
-- 邮件验证码读取：优先 Microsoft Graph，失败后回退 XOAUTH2 IMAP，再使用邮箱密码 IMAP 兜底
-- 账号综合检测：统一检测 token、Graph、密码 IMAP、验证码摘要和最佳来源
+- 邮件验证码读取：优先 Microsoft Graph，失败后回退 Outlook REST，再回退 XOAUTH2 IMAP，最后使用邮箱密码 IMAP 兜底
+- 账号综合检测：统一检测 token、Graph、Outlook REST、密码 IMAP、验证码摘要和最佳来源
 - 批量操作进度条：实时显示总进度、当前处理邮箱、成功/失败数量
 - 状态实时同步：批量执行时当前页面邮箱状态同步更新
 - 外部 API：API Key、scope 权限、限流、调用日志、latest-code/account-status 查询
 - 敏感字段加密：Refresh Token、邮箱密码、辅助密码支持加密存储
-- 自动更新：后台版本页检查 GitHub 最新提交，可选启用安全更新命令
+- 后台手动更新：后台版本页可检测 GitHub 最新版本，并在管理员确认后手动执行安全更新命令
+
+
+## v1.0.7 更新内容
+
+本版本把服务器运行版的本地增强功能正式发布，重点提升微软邮箱取码成功率，并减少后台页面自动请求。
+
+### 新增 / 优化
+
+- 新增 Outlook REST 邮件读取兜底：当 Microsoft Graph 读取失败时，会尝试 `https://outlook.office.com/api/v2.0/me` 读取收件箱和垃圾邮箱。
+- 邮件读取链路升级为：`Microsoft Graph → Outlook REST → OAuth IMAP → 密码 IMAP`。
+- 账号综合检测新增 Outlook REST 通道结果，单个检测和批量检测页面都会显示“Outlook REST 可读/失败”。
+- 验证码邮件页面改为手动获取：进入 `/mails` 后不会再自动 30 秒轮询，需点击“手动获取邮件”，减少无意义请求和微软风控风险。
+- 邮件摘要展示继续保留邮箱位置、发件人、时间、预览和验证码复制能力。
+- 后台 `/version` 版本页保留“检测更新”和“立即更新”能力，方便部署用户在后台手动检测 GitHub 新版本并执行更新。
+- 更新测试覆盖：新增 Outlook REST fallback 测试、手动获取邮件页面测试，并同步调整现有页面测试。
+
+### 当前完整功能
+
+- 邮箱账号托管：单个/批量导入、分类管理、批量导出、删除账号。
+- 多格式批量导入：支持 `邮箱----密码----Client ID----Refresh Token----辅助邮箱----辅助密码----分类`，兼容旧格式和 `|`、逗号、Tab 分隔。
+- Refresh Token 管理：检测状态、换取 Access Token、自动保存轮换后的 Refresh Token。
+- 多通道取码：Graph、Outlook REST、OAuth IMAP、密码 IMAP 多级兜底读取收件箱/垃圾箱。
+- 验证码识别：从邮件主题和正文摘要中提取验证码，并显示最新邮件摘要。
+- 账号综合检测：统一检测 token、Graph、Outlook REST、密码 IMAP、验证码摘要和最佳来源。
+- 批量操作：批量获取令牌、批量刷新、批量检测、批量改分类，带进度条和当前处理状态。
+- 项目/分类：按项目分组邮箱，配置关键词规则，支持按项目查询验证码。
+- 外部 API：API Key、scope 权限、限流、调用日志、health/projects/accounts/latest-code/account-status 查询。
+- 安全能力：双层后台登录、CSRF、安全响应头、敏感字段加密、请求日志脱敏、令牌默认隐藏。
+- 后台版本更新：`/version` 页面查看当前版本、检测 GitHub 最新版本，并可在启用时手动执行更新脚本。
 
 ## 快速开始
 
@@ -171,7 +200,7 @@ location / {
 系统读取验证码顺序：
 
 ```text
-Graph → OAuth IMAP → 密码 IMAP
+Graph → Outlook REST → OAuth IMAP → 密码 IMAP
 ```
 
 综合检测会告诉你哪个通道可用。
@@ -196,9 +225,10 @@ Graph → OAuth IMAP → 密码 IMAP
 1. 选择邮箱，或 API 指定 `email/category`
 2. 用 Refresh Token 换 Access Token
 3. 优先通过 Microsoft Graph 读取收件箱/垃圾邮箱
-4. Graph 失败后尝试 OAuth IMAP
-5. 如令牌失败且保存了密码，再尝试密码 IMAP
-6. 从最新邮件主题/摘要中识别验证码
+4. Graph 失败后尝试 Outlook REST 读取收件箱/垃圾邮箱
+5. Outlook REST 仍不可用时尝试 OAuth IMAP
+6. 如令牌失败且保存了密码，再尝试密码 IMAP
+7. 从最新邮件主题/摘要中识别验证码
 
 取不到验证码不一定代表账号挂了，可能是最近没有验证码邮件、规则不匹配、邮件延迟或 Microsoft 风控。
 
@@ -332,8 +362,9 @@ offline_access https://graph.microsoft.com/Mail.Read
 ```text
 1. Refresh Token -> Access Token
 2. Microsoft Graph 读取收件箱/垃圾箱
-3. XOAUTH2 IMAP 读取收件箱/垃圾箱
-4. 如果令牌失败且保存了密码，则用邮箱密码 IMAP 兜底
+3. Outlook REST 读取收件箱/垃圾箱
+4. XOAUTH2 IMAP 读取收件箱/垃圾箱
+5. 如果令牌失败且保存了密码，则用邮箱密码 IMAP 兜底
 ```
 
 ### 账号综合检测
@@ -356,6 +387,8 @@ offline_access https://graph.microsoft.com/Mail.Read
 | `token_failed` | 令牌失效 | Refresh Token 不可用 |
 | `graph_ok` | Graph 可读 | Graph Mail.Read 能读取邮件 |
 | `graph_failed` | Graph 失败 | Graph 读取失败 |
+| `outlook_rest_ok` | Outlook REST 可读 | Outlook REST 可读取邮件 |
+| `outlook_rest_failed` | Outlook REST 失败 | Outlook REST 读取失败 |
 | `xoauth2_imap_ok` | OAuth IMAP 可读 | Access Token 可用于 IMAP XOAUTH2 |
 | `xoauth2_imap_failed` | OAuth IMAP 失败 | XOAUTH2 IMAP 不可用 |
 | `imap_password_ok` | 密码 IMAP 可读 | 邮箱密码可通过 IMAP 读取邮件 |
